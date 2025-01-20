@@ -1,4 +1,3 @@
-# pragma pylint: disable=W0603
 """
 Cryptocurrency Exchanges support
 """
@@ -12,7 +11,8 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from math import floor, isnan
 from threading import Lock
-from typing import Any, Literal, TypeGuard
+import threading
+from typing import Any, Dict, Literal, Optional, TypeGuard
 
 import ccxt
 import ccxt.pro as ccxt_pro
@@ -25,6 +25,8 @@ from freqtrade.constants import (
     DEFAULT_AMOUNT_RESERVE_PERCENT,
     DEFAULT_TRADES_COLUMNS,
     NON_OPEN_EXCHANGE_STATES,
+    ALPACA_OPEN_EXCHANGE_STATES,
+    CANCELED_EXCHANGE_STATES,
     BidAsk,
     BuySell,
     Config,
@@ -180,9 +182,17 @@ class Exchange:
         it does basic validation whether the specified exchange and pairs are valid.
         :return: None
         """
-        self._api: ccxt.Exchange
-        self._api_async: ccxt_pro.Exchange
-        self._ws_async: ccxt_pro.Exchange = None
+        self._config: Config = {}
+        self._config.update(config)
+        #alpaca flag
+        self.is_alpaca = self._config['exchange']['name'] == "alpaca"
+        if self.is_alpaca:
+            self._api: Alpaca(config)
+            self._api_async = Alpaca(config)
+        else:
+            self._api: ccxt.Exchange 
+            self._api_async: ccxt_pro.Exchange
+            self._ws_async: ccxt_pro.Exchange = None
         self._exchange_ws: ExchangeWS | None = None
         self._markets: dict = {}
         self._trading_fees: dict[str, Any] = {}
@@ -191,9 +201,6 @@ class Exchange:
         # Due to funding fee fetching.
         self._loop_lock = Lock()
         self.loop = self._init_async_loop()
-        self._config: Config = {}
-
-        self._config.update(config)
 
         # Holds last candle refreshed time of each pair
         self._pairs_last_refresh_time: dict[PairWithTimeframe, int] = {}
@@ -249,22 +256,22 @@ class Exchange:
 
         self._trades_pagination = self._ft_has["trades_pagination"]
         self._trades_pagination_arg = self._ft_has["trades_pagination_arg"]
+        if not self.is_alpaca:
+            # Initialize ccxt objects
+            ccxt_config = self._ccxt_config
+            ccxt_config = deep_merge_dicts(exchange_conf.get("ccxt_config", {}), ccxt_config)
+            ccxt_config = deep_merge_dicts(exchange_conf.get("ccxt_sync_config", {}), ccxt_config)
 
-        # Initialize ccxt objects
-        ccxt_config = self._ccxt_config
-        ccxt_config = deep_merge_dicts(exchange_conf.get("ccxt_config", {}), ccxt_config)
-        ccxt_config = deep_merge_dicts(exchange_conf.get("ccxt_sync_config", {}), ccxt_config)
+            self._api = self._init_ccxt(exchange_conf, True, ccxt_config)
 
-        self._api = self._init_ccxt(exchange_conf, True, ccxt_config)
-
-        ccxt_async_config = self._ccxt_config
-        ccxt_async_config = deep_merge_dicts(
-            exchange_conf.get("ccxt_config", {}), ccxt_async_config
-        )
-        ccxt_async_config = deep_merge_dicts(
-            exchange_conf.get("ccxt_async_config", {}), ccxt_async_config
-        )
-        self._api_async = self._init_ccxt(exchange_conf, False, ccxt_async_config)
+            ccxt_async_config = self._ccxt_config
+            ccxt_async_config = deep_merge_dicts(
+                exchange_conf.get("ccxt_config", {}), ccxt_async_config
+            )
+            ccxt_async_config = deep_merge_dicts(
+                exchange_conf.get("ccxt_async_config", {}), ccxt_async_config
+            )
+            self._api_async = self._init_ccxt(exchange_conf, False, ccxt_async_config)
         self._has_watch_ohlcv = self.exchange_has("watchOHLCV") and self._ft_has["ws_enabled"]
         if (
             self._config["runmode"] in TRADE_MODES
@@ -294,6 +301,27 @@ class Exchange:
             self.fill_leverage_tiers()
         self.additional_exchange_init()
 
+        if self.is_alpaca and self._config["runmode"] in TRADE_MODES:
+            #init the websocket
+            self.alpaca_socket_loop = asyncio.new_event_loop()
+            if self._config["runmode"] == RunMode.LIVE:
+                self.socket_key_id = self._config["exchange"]["live_key"]
+                self.socket_key = self._config["exchange"]["live_secret"]
+            elif self._config["runmode"] == RunMode.DRY_RUN:    
+                self.socket_key_id = self._config["exchange"]["paper_key"]
+                self.socket_key = self._config["exchange"]["paper_secret"]
+            
+            self.socket_header = {
+                "APCA-API-KEY-ID" : self.socket_key_id,
+                "APCA-API-SECRET-KEY" : self.socket_key
+            }
+
+            self.alpaca_websocket = AlpacaWebSocket(self.socket_key_id, self.socket_key, self._config)
+            self.websocket_thread = threading.Thread(target=self.run_alpaca_websocket_forever)
+            self.websocket_thread.daemon = True
+            self.websocket_thread.start()
+            
+
     def __del__(self):
         """
         Destructor - clean up async stuff
@@ -309,7 +337,7 @@ class Exchange:
             and inspect.iscoroutinefunction(self._api_async.close)
             and self._api_async.session
         ):
-            logger.debug("Closing async ccxt session.")
+            logger.debug("Closing async ccxt session.") if self.is_alpaca else logger.debug("Closing async alpaca session")
             self.loop.run_until_complete(self._api_async.close())
         if (
             self._ws_async
@@ -321,25 +349,72 @@ class Exchange:
 
         if self.loop and not self.loop.is_closed():
             self.loop.close()
-
+    def _init_alpaca_loop(self) -> asyncio.AbstractEventLoop:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
     def _init_async_loop(self) -> asyncio.AbstractEventLoop:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         return loop
 
     def validate_config(self, config: Config) -> None:
-        # Check if timeframe is available
-        self.validate_timeframes(config.get("timeframe"))
+        if self.is_alpaca:
+            if config.get("timeframe") not in [
+                '1w',
+                '1d',
+                '1h',
+                '15m',
+                '30m',
+                '5m',
+                '1m'
+            ]:
+                raise ConfigurationError(
+                    f'Timeframe {config.get('timeframe')} is not supported for Alpaca. Options are 1w 1d 1h 30m 15m 5m 1m'
+                )
+            #Not implemented
+            # Check if all pairs are available
+            #self.validate_stakecurrency(config["stake_currency"])
+            #self.validate_ordertypes(config.get("order_types", {}))
+            #self.validate_order_time_in_force(config.get("order_time_in_force", {}))
+            #self.validate_trading_mode_and_margin_mode(self.trading_mode, self.margin_mode)
+            #self.validate_pricing(config["exit_pricing"])
+            #self.validate_pricing(config["entry_pricing"])
+            #self.validate_orderflow(config["exchange"])
+            #self.validate_freqai(config)
+        else:
+            # Check if timeframe is available
+            self.validate_timeframes(config.get("timeframe"))
+            # Check if all pairs are available
+            self.validate_stakecurrency(config["stake_currency"])
+            self.validate_ordertypes(config.get("order_types", {}))
+            self.validate_order_time_in_force(config.get("order_time_in_force", {}))
+            self.validate_trading_mode_and_margin_mode(self.trading_mode, self.margin_mode)
+            self.validate_pricing(config["exit_pricing"])
+            self.validate_pricing(config["entry_pricing"])
+            self.validate_orderflow(config["exchange"])
+            self.validate_freqai(config)
+    
+    def run_alpaca_websocket_forever(self):
+        print('running alpaca websocket')
+        asyncio.set_event_loop(self.alpaca_socket_loop)
+        try:
+            self.alpaca_socket_loop.run_until_complete(self.alpaca_websocket._start_websocket())
+        except Exception as e:
+            logger.error(f"Websocket error: {e}")
+        finally:
+            self.stop_alpaca_websocket()
+    
+    def stop_alpaca_websocket(self):
+        print("stopping alpaca websocket")
+        if self.alpaca_websocket.connected:
+            asyncio.run_coroutine_threadsafe(self.alpaca_websocket.close_websocket(), self.alpaca_socket_loop)
+            self.alpaca_socket_loop.call_soon_threadsafe(self.alpaca_socket_loop.stop)
 
-        # Check if all pairs are available
-        self.validate_stakecurrency(config["stake_currency"])
-        self.validate_ordertypes(config.get("order_types", {}))
-        self.validate_order_time_in_force(config.get("order_time_in_force", {}))
-        self.validate_trading_mode_and_margin_mode(self.trading_mode, self.margin_mode)
-        self.validate_pricing(config["exit_pricing"])
-        self.validate_pricing(config["entry_pricing"])
-        self.validate_orderflow(config["exchange"])
-        self.validate_freqai(config)
+    def __init_alpaca_loop(self) -> asyncio.AbstractEventLoop:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop
 
     def _init_ccxt(
         self, exchange_config: dict[str, Any], sync: bool, ccxt_kwargs: dict[str, Any]
@@ -522,6 +597,7 @@ class Exchange:
 
     def get_pair_base_currency(self, pair: str) -> str:
         """Return a pair's base currency (base/quote:settlement)"""
+
         return self.markets.get(pair, {}).get("base", "")
 
     def market_is_future(self, market: dict[str, Any]) -> bool:
@@ -642,8 +718,10 @@ class Exchange:
 
     def _load_async_markets(self, reload: bool = False) -> dict[str, Any]:
         try:
-            markets = self.loop.run_until_complete(self._api_reload_markets(reload=reload))
-
+            if self.is_alpaca:
+                markets = self._api_async.load_markets()
+            else:
+                markets = self.loop.run_until_complete(self._api_reload_markets(reload=reload))
             if isinstance(markets, Exception):
                 raise markets
             return markets
@@ -654,7 +732,6 @@ class Exchange:
     def reload_markets(self, force: bool = False, *, load_leverage_tiers: bool = True) -> None:
         """
         Reload / Initialize markets both sync and async if refresh interval has passed
-
         """
         # Check whether markets have to be reloaded
         is_initial = self._last_markets_refresh == 0
@@ -667,12 +744,15 @@ class Exchange:
         logger.debug("Performing scheduled market reload..")
         try:
             # on initial load, we retry 3 times to ensure we get the markets
-            retries: int = 3 if force else 0
-            # Reload async markets, then assign them to sync api
-            self._markets = retrier(self._load_async_markets, retries=retries)(reload=True)
-            self._api.set_markets(self._api_async.markets, self._api_async.currencies)
-            # Assign options array, as it contains some temporary information from the exchange.
-            self._api.options = self._api_async.options
+            if self.is_alpaca:
+                self._markets = self._load_async_markets(reload=True)
+            else:
+                retries: int = 3 if force else 0
+                # Reload async markets, then assign them to sync api
+                self._markets = retrier(self._load_async_markets, retries=retries)(reload=True)
+                self._api.set_markets(self._api_async.markets, self._api_async.currencies)
+                # Assign options array, as it contains some temporary information from the exchange.
+                self._api.options = self._api_async.options
             if self._exchange_ws:
                 # Set markets to avoid reloading on websocket api
                 self._ws_async.set_markets(self._api.markets, self._api.currencies)
@@ -883,6 +963,11 @@ class Exchange:
         :param endpoint: Name of endpoint (e.g. 'fetchOHLCV', 'fetchTickers')
         :return: bool
         """
+        if self.is_alpaca:
+            if hasattr(self._api, endpoint):
+                return True
+            else:
+                return False
         if endpoint in self._ft_has.get("exchange_has_overrides", {}):
             return self._ft_has["exchange_has_overrides"][endpoint]
         return endpoint in self._api_async.has and self._api_async.has[endpoint]
@@ -893,6 +978,11 @@ class Exchange:
         :param pair: Pair to get precision for
         :return: precision for amount or None. Must be used in combination with precisionMode
         """
+        #alpaca supports fractional shares
+        #not sure to what specificity.
+        if self.is_alpaca:
+            return None
+    
         return self.markets.get(pair, {}).get("precision", {}).get("amount", None)
 
     def get_precision_price(self, pair: str) -> float | None:
@@ -908,6 +998,11 @@ class Exchange:
         Returns the amount to buy or sell to a precision the Exchange accepts
 
         """
+        #alpaca supports fractional shares
+        #not sure to what specificity.
+        if self.is_alpaca:
+            return None
+    
         return amount_to_precision(amount, self.get_precision_amount(pair), self.precisionMode)
 
     def price_to_precision(self, pair: str, price: float, *, rounding_mode: int = ROUND) -> float:
@@ -959,6 +1054,27 @@ class Exchange:
         isMin = limit == "min"
 
         try:
+            if self.is_alpaca:
+                try:
+                    is_crypto = False
+                    parts = pair.split('/')
+                    if len(parts) == 2:
+                        base, quote = parts[0], parts[1]
+                    elif len(parts)>2:
+                        is_crypto = True
+                        base, quote = parts[0] + "/" + parts[1], parts[2]
+                    else:
+                        raise ValueError(f"Invalid pair format: {pair}")
+                    symbol = symbol.upper()
+                    if is_crypto:
+                        market = []
+                        #format: "BTC/USD" , not "BTC"
+                        market = self.markets.get(symbol)
+                    else:
+                        #format : "AMD"
+                        market = self.markets.get(symbol)
+                except Exception as e:
+                    logger.warning(f'could not find pair in markets')    
             market = self.markets[pair]
         except KeyError:
             raise ValueError(f"Can't get market information for symbol {pair}")
@@ -1006,8 +1122,112 @@ class Exchange:
         """
         return stake_amount / leverage
 
-    # Dry-run methods
+    def check_market_hours(self, is_extended: Optional[bool]):
+        if self.is_alpaca:
+            return self._api.check_market_hours()
+    def create_dry_order_alpaca(
+        self,
+        pair: str,
+        ordertype: str,
+        side: BuySell,
+        amount: float,
+        rate: float,
+        leverage: float,
+        params: dict | None = None,
+        stop_loss: bool = False,
+        reduceOnly: bool = False
+    ) -> Dict[str, Any]:
+        parts = pair.split('/')
+        if len(parts) == 2:
+            base, quote = parts[0], parts[1]
+        elif len(parts)>2:
+            is_crypto = True
+            base, quote = parts[0] + "/" + parts[1], parts[2]
+        
+        now = dt_now()
+        _amount = amount
+        dry_order: Dict[str,Any] = {
+            "symbol": pair if not is_crypto else base,
+            "price": rate,
+            "average": rate,
+            "amount": _amount,
+            "cost": _amount * rate,
+            "type": ordertype,
+            "side": side,
+            "filled": 0,
+            "remaining": _amount,
+            "datetime": now.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            "timestamp": dt_ts(now),
+            "status": "open",
+            "fee": None,
+            "info": {},            
+        }
+        if stop_loss:
+            dry_order["info"] = {"stopPrice": dry_order["price"]}
+            dry_order[self._ft_has["stop_price_prop"]] = dry_order["price"]
+            # Workaround to avoid filling stoploss orders immediately
+            dry_order["ft_order_type"] = "stoploss"
+        orderbook : Optional[OrderBook] = None
+        if ordertype == "limit" and orderbook:
+            # Allow a 1% price difference
+            allowed_diff = 0.01
+            if self._dry_is_price_crossed(pair, side, rate, orderbook, allowed_diff):
+                logger.info(
+                    f"Converted order {pair} to market order due to price {rate} crossing spread "
+                    f"by more than {allowed_diff:.2%}."
+                )
+                dry_order["type"] = "market"
 
+        if dry_order["type"] == "market" and not dry_order.get("ft_order_type"):
+            # Update market order pricing
+            average = self.get_dry_market_fill_price(pair, side, amount, rate, orderbook)
+            dry_order.update(
+                {
+                    "average": average,
+                    "filled": _amount,
+                    "remaining": 0.0,
+                    "status": "closed",
+                    "cost": (_amount * average),
+                }
+            )
+            # market orders will always incurr taker fees
+            dry_order = self.add_dry_order_fee(pair, dry_order, "taker")
+
+        #create alpaca paper_order
+        # fetch the order id from the api for sotrage
+        # custom implementation in Trade and order model -> trade_model.py
+
+        response = self._api.create_paper_order (base, dry_order["type"], side, amount, rate, leverage, params, stop_loss)
+        order_id = response.get("id")
+        created_at = response.get("created_at")
+        filled_avg_price = response.get("filled_avg_price")
+        filled_at = response.get("filled at")
+        status = response.get("status")
+        qty = response.get("qty")
+        filled_qty = response.get("filled_qty")
+        if status in ALPACA_OPEN_EXCHANGE_STATES:
+            status = "open"
+        elif status in CANCELED_EXCHANGE_STATES:
+            status = "canceled"
+        elif status in NON_OPEN_EXCHANGE_STATES:
+            status = "closed"
+        
+        dry_order.update(
+            {
+                "id" : order_id,
+                "average" : filled_avg_price,
+                "filled" : filled_qty,
+                "remaining": float(qty) - float(filled_qty),
+                "status" : status
+            }
+        )
+        dry_order = self.check_dry_limit_order_filled(
+            dry_order, immediate=True, orderbook=orderbook
+        )
+
+        self._dry_run_open_orders[dry_order["id"]] = dry_order
+        return dry_order
+    # Dry-run methods
     def create_dry_run_order(
         self,
         pair: str,
@@ -1025,6 +1245,7 @@ class Exchange:
         _amount = self._contracts_to_amount(
             pair, self.amount_to_precision(pair, self._amount_to_contracts(pair, amount))
         )
+        
         dry_order: CcxtOrder = {
             "id": order_id,
             "symbol": pair,
@@ -1153,6 +1374,9 @@ class Exchange:
         orderbook: OrderBook | None = None,
         offset: float = 0.0,
     ) -> bool:
+        if self.is_alpaca:
+            #alpaca doesn't have l2 orderbooks data for stocks 2024
+            return False
         if not self.exchange_has("fetchL2OrderBook"):
             return True
         if not orderbook:
