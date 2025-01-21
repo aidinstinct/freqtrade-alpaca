@@ -6,7 +6,18 @@
 [![Documentation](https://readthedocs.org/projects/freqtrade/badge/)](https://www.freqtrade.io)
 [![Maintainability](https://api.codeclimate.com/v1/badges/5737e6d668200b7518ff/maintainability)](https://codeclimate.com/github/freqtrade/freqtrade/maintainability)
 
-Freqtrade is a free and open source crypto trading bot written in Python. It is designed to support all major exchanges and be controlled via Telegram or webUI. It contains backtesting, plotting and money management tools as well as strategy optimization by machine learning.
+freqtrade-alpaca is a free and open source fork of freqtrade for trading crypto and us equities, written in Python. It currently supports Alpaca Markets and ccxt supported exchanges. 
+
+Currently supported features
+ - Alpaca Markets
+   - Backtesting
+     1. Dynamic fee generation for crypto related trades.
+     2. Extended hours trading (to mirror market conditions)
+     3. Support to backtest both crypto and us equities in the same configuration
+   - Data Management
+     1. Downloads historic data from alpaca exchange
+     2. Stores crypto data in the format "BTC_USD-USD-timeframe.feather"
+     
 
 ![freqtrade](https://raw.githubusercontent.com/freqtrade/freqtrade/develop/docs/assets/freqtrade-screenshot.png)
 
@@ -26,7 +37,7 @@ hesitate to read the source code and understand the mechanism of this bot.
 ## Supported Exchange marketplaces
 
 Please read the [exchange specific notes](docs/exchanges.md) to learn about eventual, special configurations needed for each exchange.
-
+- [X] [Alpaca](https://alpaca.markets/)
 - [X] [Binance](https://www.binance.com/)
 - [X] [Bitmart](https://bitmart.com/)
 - [X] [BingX](https://bingx.com/invite/0EM9RX)
@@ -161,7 +172,7 @@ Telegram is not mandatory. However, this is a great way to control your bot. Mor
 The project is currently setup in two main branches:
 
 - `develop` - This branch has often new features, but might also contain breaking changes. We try hard to keep this branch as stable as possible.
-- `stable` - This branch contains the latest stable release. This branch is generally well tested.
+- `main` - This branch contains the latest stable release. This branch is generally well tested.
 - `feat/*` - These are feature branches, which are being worked on heavily. Please don't use these unless you want to test a specific feature.
 
 ## Support
