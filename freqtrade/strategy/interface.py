@@ -1119,6 +1119,7 @@ class IStrategy(ABC, HyperStrategyMixin):
     @staticmethod
     def preserve_df(dataframe: DataFrame) -> tuple[int, float, datetime]:
         """keep some data for dataframes"""
+        #print(dataframe.tail(100))
         return len(dataframe), dataframe["close"].iloc[-1], dataframe["date"].iloc[-1]
 
     def assert_df(self, dataframe: DataFrame, df_len: int, df_close: float, df_date: datetime):
@@ -1127,9 +1128,12 @@ class IStrategy(ABC, HyperStrategyMixin):
         """
         message_template = "Dataframe returned from strategy has mismatching {}."
         message = ""
+
         if dataframe is None:
             message = "No dataframe returned (return statement missing?)."
         elif df_len != len(dataframe):
+            #print(df_len)
+            #print(len(dataframe))
             message = message_template.format("length")
         elif df_close != dataframe["close"].iloc[-1]:
             message = message_template.format("last close price")

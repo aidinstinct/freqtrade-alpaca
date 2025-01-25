@@ -97,9 +97,9 @@ CUSTOM_TAG_MAX_LENGTH = 255
 DL_DATA_TIMEFRAMES = ["1m", "5m"]
 
 ENV_VAR_PREFIX = "FREQTRADE__"
-
+ALPACA_OPEN_EXCHANGE_STATES = ("open", "accepted", "new", "partially_filled", "pending_new", "accepted_for_bidding", "stopped", "done_for_day")
 CANCELED_EXCHANGE_STATES = ("cancelled", "canceled", "expired", "rejected")
-NON_OPEN_EXCHANGE_STATES = CANCELED_EXCHANGE_STATES + ("closed",)
+NON_OPEN_EXCHANGE_STATES = CANCELED_EXCHANGE_STATES + ("closed", "filled", "suspended",)
 
 # Define decimals per coin for outputs
 # Only used for outputs.

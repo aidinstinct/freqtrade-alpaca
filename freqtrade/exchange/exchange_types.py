@@ -1,4 +1,4 @@
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, TypedDict, Optional
 
 from freqtrade.enums import CandleType
 
@@ -52,6 +52,12 @@ class FtHas(TypedDict, total=False):
     # Websocket control
     ws_enabled: bool
 
+class AlpacaTicker(TypedDict):
+    symbol: str
+    ask: Optional[float]
+    bid: Optional[float]
+    last: Optional[float]
+    # Several more - only listing required. 
 
 class Ticker(TypedDict):
     symbol: str
@@ -97,6 +103,7 @@ class CcxtPosition(TypedDict):
     liquidationPrice: float | None
 
 
+OrderObj = dict[str, Any]
 CcxtOrder = dict[str, Any]
 
 # pair, timeframe, candleType, OHLCV, drop last?,

@@ -1,6 +1,8 @@
+from typing import Tuple, Optional
+
 import logging
 import operator
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta,timezone
 from pathlib import Path
 
 from pandas import DataFrame, concat
@@ -158,8 +160,85 @@ def refresh_data(
             candle_type=candle_type,
         )
 
-
 def _load_cached_data_for_updating(
+    pair: str,
+    timeframe: str,
+    timerange: TimeRange | None,
+    data_handler: IDataHandler,
+    candle_type: CandleType,
+    prepend: bool = False,
+) -> Tuple[DataFrame, Optional[int], Optional[int]]:
+    """
+    Load cached data to download more data.
+    If timerange is passed in, checks whether data from an before the stored data will be
+    downloaded.
+    If that's the case then what's available should be completely overwritten.
+    Otherwise downloads always start at the end of the available data to avoid data gaps.
+    Note: Only used by download_pair_history().
+    """
+    start = None
+    end = None
+    print(timerange)
+    if timerange:
+        if timerange.starttype == "date":
+            start = timerange.startdt
+        if timerange.stoptype == "date":
+            end = timerange.stopdt
+    # Intentionally don't pass timerange in - since we need to load the full dataset.
+    data = data_handler.ohlcv_load(
+        pair,
+        timeframe=timeframe,
+        timerange=None,
+        fill_missing=False,
+        drop_incomplete=True,
+        warn_no_data=False,
+        candle_type=candle_type,
+    )
+    print(f'start requested {start}')
+    print(f'end requested {end}')
+    if not data.empty:
+        #alpaca will default end to datetime.now-timedelta(mins=15)
+        #there is no end parameter in the historic ohlcv url, only start
+        if not end:
+            end = datetime.now(timezone.utc)
+        #check the df start and end times
+        df_end = data.iloc[-1]['date']
+        df_start = data.iloc[0]['date']
+        if start < df_start:
+            print('redownloading all')
+            #redownload all
+            start_ms = int(start.timestamp() * 1000) if start else None
+            end_ms = int(end.timestamp() * 1000) if end else None
+        elif end < df_end and start > df_start:
+            #already have the data
+            print('end requested is less than dataframe end')
+            print('start is greater than df_start')
+            print('the data already exists in the df')
+            print('download nothing.')
+
+            end_ms = None
+            start_ms = None
+        elif end > df_end and start > df_start:
+            print('start is within')
+            print('end is not')
+            start_ms = int(df_end.timestamp() * 1000) if df_end else None
+            end_ms = int(end.timestamp() * 1000) if end else None
+        #elif end < df_end and start < df_start:
+        #    print('start is not within')
+        #    print('end is within')
+        else:
+            start_ms=None
+            end_ms=None
+    else:
+        # No data exists, request the full range
+        print('no data exists')
+        start_ms = int(start.timestamp() * 1000) if start else None
+        end_ms = int(end.timestamp() * 1000) if end else None
+    
+    #if start_ms is not None and end_ms is not None:
+    #    print(f'ohlcv_load -> start_ms {start_ms} end_ms {end_ms if end_ms else "None"}')
+    return data, start_ms, end_ms
+def _load_cached_data_for_updating_repo(
     pair: str,
     timeframe: str,
     timerange: TimeRange | None,
@@ -285,6 +364,10 @@ def _download_pair_history(
             candle_type=candle_type,
             until_ms=until_ms if until_ms else None,
         )
+
+        if isinstance(new_dataframe, list):
+            new_dataframe = DataFrame(new_dataframe)
+            print(new_dataframe.head())
         logger.info(f"Downloaded data for {pair} with length {len(new_dataframe)}.")
         if data.empty:
             data = new_dataframe
@@ -588,7 +671,7 @@ def validate_backtest_data(
 
 def download_data_main(config: Config) -> None:
     from freqtrade.resolvers.exchange_resolver import ExchangeResolver
-
+    
     exchange = ExchangeResolver.load_exchange(config, validate=False)
 
     download_data(config, exchange)
