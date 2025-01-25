@@ -2,7 +2,8 @@ from datetime import datetime, timezone
 
 import ccxt
 from ccxt import ROUND_DOWN, ROUND_UP
-
+from typing import Optional
+from datetime import timedelta
 from freqtrade.util.datetime_helpers import dt_from_ts, dt_ts
 
 
@@ -76,3 +77,30 @@ def timeframe_to_next_date(timeframe: str, date: datetime | None = None) -> date
         date = datetime.now(timezone.utc)
     new_timestamp = ccxt.Exchange.round_timeframe(timeframe, dt_ts(date), ROUND_UP) // 1000
     return dt_from_ts(new_timestamp)
+
+
+def alpaca_timeframe_to_seconds(timeframe: str) -> int:
+    """
+    Alpaca timeframe to seconds, Min included as example
+    Timeframe utilizes global convention. ie m,h,d,w
+    :param timeframe: timeframe in string format (e.g. "5m")
+    :returns: timeframe in seconds.
+    """
+    if timeframe.endswith("Min"):
+        return int(timeframe[:-3]) * 60
+    elif timeframe.endswith("m"):
+        return int(timeframe[:-1]) * 60
+    elif timeframe.endswith("H"):
+        return int(timeframe[:-1]) * 3600
+    elif timeframe.endswith("h"):
+        return int(timeframe[:-1]) * 3600
+    elif timeframe.endswith("D"):
+        return int(timeframe[:-1]) * 86400
+    elif timeframe.endswith("d"):
+        return int(timeframe[:-1]) * 86400
+    elif timeframe.endswith("W"):
+        return int(timeframe[:-1]) * 604800
+    elif timeframe.endswith("w"):
+        return int(timeframe[:-1]) * 604800
+    else:
+        raise ValueError(f"Unknown timeframe format: {timeframe}")

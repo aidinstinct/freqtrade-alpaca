@@ -73,12 +73,15 @@ class ExchangeResolver(IResolver):
 
         try:
             ex_class = getattr(exchanges, exchange_name)
-
+            #print(ex_class)
+            #print(**kwargs)
             exchange = ex_class(**kwargs)
+
             if exchange:
                 logger.info(f"Using resolved exchange '{exchange_name}'...")
                 return exchange
-        except AttributeError:
+        except Exception as e:
+            print(e)
             # Pass and raise ImportError instead
             pass
 

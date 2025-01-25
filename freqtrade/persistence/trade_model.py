@@ -1,14 +1,13 @@
 """
 This module contains the class to persist trades into SQLite
 """
-
+from typing import List, Tuple, Any, Dict, Literal, Optional, TypeGuard, ClassVar, Optional, cast
 import logging
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from math import isclose
-from typing import Any, ClassVar, Optional, cast
 
 from sqlalchemy import (
     Enum,
@@ -33,6 +32,7 @@ from freqtrade.constants import (
     DATETIME_PRINT_FORMAT,
     MATH_CLOSE_PREC,
     NON_OPEN_EXCHANGE_STATES,
+    ALPACA_OPEN_EXCHANGE_STATES,
     BuySell,
     LongShort,
 )
@@ -164,8 +164,9 @@ class Order(ModelBase):
 
     @property
     def safe_amount_after_fee(self) -> float:
+        #logger.info(f'SAFE AMOUNT AFTER FEE PROPERTY -> safe filled {self.safe_filled} and safe fee base {self.safe_fee_base}')
         return self.safe_filled - self.safe_fee_base
-
+    
     @property
     def trade(self) -> "LocalTrade":
         return self._trade_bt or self._trade_live
@@ -200,36 +201,103 @@ class Order(ModelBase):
         """
         Update Order from ccxt response
         Only updates if fields are available from ccxt -
+        Includes logic to match alpaca order obj to ccxt format.
         """
         if self.order_id != str(order["id"]):
             raise DependencyException("Order-id's don't match")
+        if "client_order_id" not in order:
+            print('client order if not in order')
+            #its a ccxt object
+            self.status = safe_value_fallback(order, "status", default_value=self.status)
+            self.symbol = safe_value_fallback(order, "symbol", default_value=self.symbol)
+            self.order_type = safe_value_fallback(order, "type", default_value=self.order_type)
+            self.side = safe_value_fallback(order, "side", default_value=self.side)
+            self.price = safe_value_fallback(order, "price", default_value=self.price)
+            self.amount = safe_value_fallback(order, "amount", default_value=self.amount)
+            self.filled = safe_value_fallback(order, "filled", default_value=self.filled)
+            self.average = safe_value_fallback(order, "average", default_value=self.average)
+            self.remaining = safe_value_fallback(order, "remaining", default_value=self.remaining)
+            self.cost = safe_value_fallback(order, "cost", default_value=self.cost)
+            self.stop_price = safe_value_fallback(order, "stopPrice", default_value=self.stop_price)
+            order_date = safe_value_fallback(order, "timestamp")
+            if order_date:
+                self.order_date = datetime.fromtimestamp(order_date / 1000, tz=timezone.utc)
+            elif not self.order_date:
+                self.order_date = dt_now()
 
-        self.status = safe_value_fallback(order, "status", default_value=self.status)
-        self.symbol = safe_value_fallback(order, "symbol", default_value=self.symbol)
-        self.order_type = safe_value_fallback(order, "type", default_value=self.order_type)
-        self.side = safe_value_fallback(order, "side", default_value=self.side)
-        self.price = safe_value_fallback(order, "price", default_value=self.price)
-        self.amount = safe_value_fallback(order, "amount", default_value=self.amount)
-        self.filled = safe_value_fallback(order, "filled", default_value=self.filled)
-        self.average = safe_value_fallback(order, "average", default_value=self.average)
-        self.remaining = safe_value_fallback(order, "remaining", default_value=self.remaining)
-        self.cost = safe_value_fallback(order, "cost", default_value=self.cost)
-        self.stop_price = safe_value_fallback(order, "stopPrice", default_value=self.stop_price)
-        order_date = safe_value_fallback(order, "timestamp")
-        if order_date:
-            self.order_date = dt_from_ts(order_date)
-        elif not self.order_date:
-            self.order_date = dt_now()
+            self.ft_is_open = True
+            if self.status in NON_OPEN_EXCHANGE_STATES:
+                self.ft_is_open = False
+                if (order.get("filled", 0.0) or 0.0) > 0 and not self.order_filled_date:
+                    self.order_filled_date = dt_from_ts(
+                        safe_value_fallback(order, "lastTradeTimestamp", default_value=dt_ts())
+                    )
+            self.order_update_date = datetime.now(timezone.utc)
+            print(f'the amount when updating from ccxt -> {self.amount}')
+        #its the alpaca object
+        #need some python magic to match the fields
+        else:
+            field_mapping_tuples = [
+                ("status", "status"),
+                ("symbol", "symbol"),
+                ("type", "order_type"),
+                ("side", "side"),
+                ("filled_avg_price", "price"),
+                ("filled_avg_price", "average"),
+                ("filled_qty", "filled"),
+                ("filled_qty", "amount"),
+                ("remaining_qty", "remaining"),
+                ("cost", "cost"),
+                ("stop_price", "stop_price"),
+                ("created_at", "order_date"),
+            ]
 
-        self.ft_is_open = True
-        if self.status in NON_OPEN_EXCHANGE_STATES:
-            self.ft_is_open = False
-            if (order.get("filled", 0.0) or 0.0) > 0 and not self.order_filled_date:
-                self.order_filled_date = dt_from_ts(
-                    safe_value_fallback(order, "lastTradeTimestamp", default_value=dt_ts())
-                )
-        self.order_update_date = datetime.now(timezone.utc)
+            #should iterate through duplicate keys.
+            #print(f'Update from ccxt object -> {order["status"]}')
+            for alpaca_field, internal_field in field_mapping_tuples:
+                setattr(self, internal_field, safe_value_fallback(order, alpaca_field, default_value=getattr(self, internal_field)))
+            #print(f'Update from ccxt object -> {order["status"]}')
+            order_date = safe_value_fallback(order, "created_at")
+            order_status = safe_value_fallback(order, "status")
+            
+            logger.info(f'The order status {self.status}.')
+            if order_status in ALPACA_OPEN_EXCHANGE_STATES:
+                self.status = "open"
 
+            if order_date:
+                order_date = order_date.split(".")[0] + "Z"
+                self.order_date = datetime.fromisoformat(order_date.replace("Z", "+00:00"))
+            elif not self.order_date:
+                self.order_date = dt_now()
+            else:
+                self.cost = None
+
+            self.ft_is_open = True
+            self.ft_price = self.price if self.price else 0.0
+            if self.status in NON_OPEN_EXCHANGE_STATES:
+                #the order is not open, need to calculate the amount with precision.
+                if order.get("qty") and order.get("filled_avg_price"):
+                    logger.info(f'The order status {self.status}. Setting ft_is_open to False')
+                    self.ft_is_open = False
+                    logger.info(f'The order {self}')
+                    cost = float(order.get("qty")) * float(order.get("filled_avg_price"))
+                    self.cost = cost
+                    self.filled = order.get("filled_qty")
+                    self.amount = order.get("filled_qty") 
+                    if (order.get("filled_qty", 0.0) or 0.0) > 0 and not self.order_filled_date:
+                        self.order_filled_date = dt_from_ts(
+                            safe_value_fallback(order, "lastTradeTimestamp", default_value=dt_ts())
+                        )
+                else:
+                    logger.info(f'The order status {self.status}. Setting ft_is_open to False')
+                    self.ft_is_open = False
+                    logger.info(f'The order {self}')
+                    if (order.get("filled", 0.0) or 0.0) > 0 and not self.order_filled_date:
+                        self.order_filled_date = dt_from_ts(
+                            safe_value_fallback(order, "lastTradeTimestamp", default_value=dt_ts())
+                        )
+            self.order_update_date = datetime.now(timezone.utc)
+    
     def to_ccxt_object(self, stopPriceName: str = "stopPrice") -> dict[str, Any]:
         order: dict[str, Any] = {
             "id": self.order_id,
@@ -338,7 +406,33 @@ class Order(ModelBase):
             Trade.commit()
         else:
             logger.warning(f"Did not find order for {order}.")
+    
+    @classmethod
+    def parse_from_alpaca_object(
+        cls,
+        order: Dict[str, Any],
+        pair: str,
+        side: str,
+        amount: Optional[float] = None,
+        price: Optional[float] = None,
+    ) -> Self:
+        """
+        Parse an order from a alpaca object and return a new order Object.
+        Optional support for overriding amount and price is only used for test simplification.
+        """
+        filled_avg_price = order["filled_avg_price"] if order["filled_avg_price"] is not None else 0
+        logger.info(f"Parsing Order: {order}")
+        o = cls(
+            order_id=str(order["id"]),
+            ft_order_side=side,
+            ft_pair=pair,
+            ft_amount=amount if amount else order['qty'],
+            ft_price=price if price else filled_avg_price
+        )
 
+        o.update_from_ccxt_object(order)
+        return o
+    
     @classmethod
     def parse_from_ccxt_object(
         cls,
@@ -507,6 +601,7 @@ class LocalTrade:
     def _date_last_filled_utc(self) -> datetime | None:
         """Date of the last filled order"""
         orders = self.select_filled_orders()
+        #print(orders)
         if orders:
             return max(o.order_filled_utc for o in orders if o.order_filled_utc)
         return None
@@ -887,7 +982,10 @@ class LocalTrade:
         :param order: order retrieved by exchange.fetch_order()
         :return: None
         """
-
+        #add flag for alpaca
+        #no need to calculate the fee deduction
+        #exchange return the filled amount.
+        #backtesting dynamically populates the fee
         # Ignore open and cancelled orders
         if order.status == "open" or order.safe_price is None:
             return
@@ -906,7 +1004,6 @@ class LocalTrade:
             if self.is_open:
                 payment = "SELL" if self.is_short else "BUY"
                 logger.info(f"{order_type}_{payment} has been fulfilled for {self}.")
-
             self.recalc_trade_from_orders()
         elif order.ft_order_side == self.exit_side:
             if self.is_open:
@@ -923,9 +1020,29 @@ class LocalTrade:
             raise ValueError(f"Unknown order type: {order.order_type}")
 
         if order.ft_order_side != self.entry_side:
+            #print(order)
+            #print(f'order safe amount -> {order.safe_amount}')
+            #print(f'Amount to contract precision {self.amount}, {self.amount_precision}, {self.precision_mode}, {self.contract_size}')
             amount_tr = amount_to_contract_precision(
                 self.amount, self.amount_precision, self.precision_mode, self.contract_size
             )
+            #print(f'order safe price -> {order.safe_price}')
+            #print(f'safe amount after fee: {order.safe_amount_after_fee}')
+            #print(f'amount_tr: {amount_tr}')
+            #print(f'abs_tol -> {MATH_CLOSE_PREC}')
+            #print('or')
+            #print(f'not recalculating {not recalculating} -> recalculating -> {recalculating}')
+            #print('and')
+            #print(f'safe amount after fee: {order.safe_amount_after_fee} > amount_tr -> {amount_tr}')
+            ##try to close without out to 0 to debug
+            #print(f'trade amount {self.amount}')
+            #print(f'LocalTrade exchange -> {self.exchange}')
+            #print(f'safe_filled {order.safe_filled}, order safe amount -> {order.safe_amount}')
+
+            #if is_alpaca:
+            #    #debugging
+            #    self.close_alpaca(order.safe_price)
+            #else:
             if isclose(order.safe_amount_after_fee, amount_tr, abs_tol=MATH_CLOSE_PREC) or (
                 not recalculating and order.safe_amount_after_fee > amount_tr
             ):
@@ -933,19 +1050,33 @@ class LocalTrade:
                 self.close(order.safe_price)
             else:
                 self.recalc_trade_from_orders()
-
         Trade.commit()
-
+    def close_alpaca(self, rate: float, *, show_msg: bool = True):
+        """
+        Sets close_rate to the given rate, calculates total profit
+        and marks trade as closed
+        """
+        self.close_rate = rate
+        self.close_date = self.close_date or dt_now()
+        self.is_open = False
+        self.exit_order_status = "closed"
+        self.recalc_trade_from_orders_alpaca(is_closing=True)
+        if show_msg:
+            logger.info(
+                f"Marking {self} as closed as the trade is fulfilled "
+                "and found no open orders for it."
+            )
     def close(self, rate: float, *, show_msg: bool = True) -> None:
         """
         Sets close_rate to the given rate, calculates total profit
         and marks trade as closed
         """
         self.close_rate = rate
-        self.close_date = self.close_date or self._date_last_filled_utc or dt_now()
+        self.close_date = self.close_date or dt_now()
         self.is_open = False
         self.exit_order_status = "closed"
         self.recalc_trade_from_orders(is_closing=True)
+    
         if show_msg:
             logger.info(
                 f"Marking {self} as closed as the trade is fulfilled "
@@ -1133,8 +1264,9 @@ class LocalTrade:
         :param open_rate: open_rate to use. Defaults to self.open_rate if not provided.
         :return: Profit structure, containing absolute and relative profits.
         """
-
         close_trade_value = self.calc_close_trade_value(rate, amount)
+
+        #print(f'close_trade_value -> {close_trade_value}')
         if amount is None or open_rate is None:
             open_trade_value = self.open_trade_value
         else:
@@ -1144,7 +1276,6 @@ class LocalTrade:
             profit_abs = open_trade_value - close_trade_value
         else:
             profit_abs = close_trade_value - open_trade_value
-
         try:
             if self.is_short:
                 profit_ratio = (1 - (close_trade_value / open_trade_value)) * self.leverage
@@ -1160,8 +1291,18 @@ class LocalTrade:
             if self.max_stake_amount
             else 0.0
         )
+
+        #logger.info(f'{profit_abs,profit_ratio,profit_abs + self.realized_profit,total_profit_ratio}')
         total_profit_ratio = float(f"{total_profit_ratio:.8f}")
         profit_abs = float(f"{profit_abs:.8f}")
+        #prof_struct = ProfitStruct(
+        #    profit_abs=profit_abs,
+        #    profit_ratio=profit_ratio,
+        #    total_profit=profit_abs + self.realized_profit,
+        #    total_profit_ratio=total_profit_ratio,
+        #)
+
+        #logger.info(f'profit structure -> {prof_struct}')
 
         return ProfitStruct(
             profit_abs=profit_abs,
@@ -1197,84 +1338,173 @@ class LocalTrade:
 
         return float(f"{profit_ratio:.8f}")
 
-    def recalc_trade_from_orders(self, *, is_closing: bool = False):
-        ZERO = FtPrecise(0.0)
-        current_amount = FtPrecise(0.0)
-        current_stake = FtPrecise(0.0)
-        max_stake_amount = FtPrecise(0.0)
-        total_stake = 0.0  # Total stake after all buy orders (does not subtract!)
-        avg_price = FtPrecise(0.0)
-        close_profit = 0.0
-        close_profit_abs = 0.0
-        # Reset funding fees
-        self.funding_fees = 0.0
-        funding_fees = 0.0
-        ordercount = len(self.orders) - 1
-        for i, o in enumerate(self.orders):
-            if o.ft_is_open or not o.filled:
-                continue
-            funding_fees += o.funding_fee or 0.0
-            tmp_amount = FtPrecise(o.safe_amount_after_fee)
-            tmp_price = FtPrecise(o.safe_price)
 
-            is_exit = o.ft_order_side != self.entry_side
-            side = FtPrecise(-1 if is_exit else 1)
-            if tmp_amount > ZERO and tmp_price is not None:
-                current_amount += tmp_amount * side
-                price = avg_price if is_exit else tmp_price
-                current_stake += price * tmp_amount * side
+    def recalc_trade_from_orders_alpaca(self, *, is_closing: bool = False):
+        try:
+            ZERO = FtPrecise(0.0)
+            current_amount = FtPrecise(0.0)
+            current_stake = FtPrecise(0.0)
+            max_stake_amount = FtPrecise(0.0)
+            total_stake = 0.0  # Total stake after all buy orders (does not subtract!)
+            avg_price = FtPrecise(0.0)
+            close_profit = 0.0
+            close_profit_abs = 0.0
+            # Reset funding fees
+            self.funding_fees = 0.0
+            funding_fees = 0.0
+            ordercount = len(self.orders) - 1
+            for i, o in enumerate(self.orders):
+                if o.ft_is_open or not o.filled:
+                    continue
+                funding_fees += o.funding_fee or 0.0
+                tmp_amount = FtPrecise(o.safe_amount_after_fee)
+                tmp_price = FtPrecise(o.safe_price)
 
-                if current_amount > ZERO and not is_exit:
-                    avg_price = current_stake / current_amount
+                is_exit = o.ft_order_side != self.entry_side
+                side = FtPrecise(-1 if is_exit else 1)
+                if tmp_amount > ZERO and tmp_price is not None:
+                    current_amount += tmp_amount * side
+                    price = avg_price if is_exit else tmp_price
+                    current_stake += price * tmp_amount * side
 
-            if is_exit:
-                # Process exits
-                if i == ordercount and is_closing:
-                    # Apply funding fees only to the last closing order
-                    self.funding_fees = funding_fees
+                    if current_amount > ZERO and not is_exit:
+                        avg_price = current_stake / current_amount
 
-                exit_rate = o.safe_price
-                exit_amount = o.safe_amount_after_fee
-                prof = self.calculate_profit(exit_rate, exit_amount, float(avg_price))
-                close_profit_abs += prof.profit_abs
-                if total_stake > 0:
-                    # This needs to be calculated based on the last occurring exit to be aligned
-                    # with realized_profit.
-                    close_profit = (close_profit_abs / total_stake) * self.leverage
-            else:
-                total_stake += self._calc_open_trade_value(tmp_amount, price)
-                max_stake_amount += tmp_amount * price
-        self.funding_fees = funding_fees
-        self.max_stake_amount = float(max_stake_amount)
+                if is_exit:
+                    # Process exits
+                    if i == ordercount and is_closing:
+                        # Apply funding fees only to the last closing order
+                        self.funding_fees = funding_fees
 
-        if close_profit:
-            self.close_profit = close_profit
-            self.realized_profit = close_profit_abs
-            self.close_profit_abs = prof.profit_abs
+                    exit_rate = o.safe_price
+                    exit_amount = o.safe_amount_after_fee
+                    prof = self.calculate_profit(exit_rate, exit_amount, float(avg_price))
+                    close_profit_abs += prof.profit_abs
+                    if total_stake > 0:
+                        # This needs to be calculated based on the last occurring exit to be aligned
+                        # with realized_profit.
+                        close_profit = (close_profit_abs / total_stake) * self.leverage
+                else:
+                    total_stake += self._calc_open_trade_value(tmp_amount, price)
+                    max_stake_amount += tmp_amount * price
+            self.funding_fees = funding_fees
+            self.max_stake_amount = float(max_stake_amount)
 
-        current_amount_tr = amount_to_contract_precision(
-            float(current_amount), self.amount_precision, self.precision_mode, self.contract_size
-        )
-        if current_amount_tr > 0.0:
-            # Trade is still open
-            # Leverage not updated, as we don't allow changing leverage through DCA at the moment.
-            self.open_rate = price_to_precision(
-                float(current_stake / current_amount),
-                self.price_precision,
-                self.precision_mode_price,
+            if close_profit:
+                self.close_profit = close_profit
+                self.realized_profit = close_profit_abs
+                self.close_profit_abs = prof.profit_abs
+            #this might throw an error since we are not using ccxt for alpaca trades.
+            current_amount_tr = amount_to_contract_precision(
+                float(current_amount), self.amount_precision, self.precision_mode, self.contract_size
             )
-            self.amount = current_amount_tr
-            self.stake_amount = float(current_stake) / (self.leverage or 1.0)
-            self.fee_open_cost = self.fee_open * float(self.max_stake_amount)
-            self.recalc_open_trade_value()
-            if self.stop_loss_pct is not None and self.open_rate is not None:
-                self.adjust_stop_loss(self.open_rate, self.stop_loss_pct)
-        elif is_closing and total_stake > 0:
-            # Close profit abs / maximum owned
-            # Fees are considered as they are part of close_profit_abs
-            self.close_profit = (close_profit_abs / total_stake) * self.leverage
-            self.close_profit_abs = close_profit_abs
+            #current_amount_tr = self.amount
+            #the fee deducted amount was dynamically populated from handle_on_exchange_order 
+            if current_amount_tr > 0.0:
+                print(f'trade is still open')
+                # Trade is still open
+                # Leverage not updated, as we don't allow changing leverage through DCA at the moment.
+                self.open_rate = price_to_precision(
+                    float(current_stake / current_amount),
+                    self.price_precision,
+                    self.precision_mode_price,
+                )
+                print(self.open_rate)
+                self.amount = current_amount_tr
+                print(f'amount -> {self.amount}')
+                self.stake_amount = float(current_stake) / (self.leverage or 1.0)
+                print(f'stake amount -> {self.stake_amount}')
+                self.fee_open_cost = self.fee_open * float(self.max_stake_amount)
+                self.recalc_open_trade_value()
+                if self.stop_loss_pct is not None and self.open_rate is not None:
+                    self.adjust_stop_loss(self.open_rate, self.stop_loss_pct)
+            elif is_closing and total_stake > 0:
+                # Close profit abs / maximum owned
+                # Fees are considered as they are part of close_profit_abs
+                self.close_profit = (close_profit_abs / total_stake) * self.leverage
+                self.close_profit_abs = close_profit_abs
+        except Exception as e:
+            print(f'exception raised -> {e}')
 
+    def recalc_trade_from_orders(self, *, is_closing: bool = False):
+        try:
+            ZERO = FtPrecise(0.0)
+            current_amount = FtPrecise(0.0)
+            current_stake = FtPrecise(0.0)
+            max_stake_amount = FtPrecise(0.0)
+            total_stake = 0.0  # Total stake after all buy orders (does not subtract!)
+            avg_price = FtPrecise(0.0)
+            close_profit = 0.0
+            close_profit_abs = 0.0
+            # Reset funding fees
+            self.funding_fees = 0.0
+            funding_fees = 0.0
+            ordercount = len(self.orders) - 1
+            for i, o in enumerate(self.orders):
+                if o.ft_is_open or not o.filled:
+                    continue
+                funding_fees += o.funding_fee or 0.0
+                tmp_amount = FtPrecise(o.safe_amount_after_fee)
+                tmp_price = FtPrecise(o.safe_price)
+
+                is_exit = o.ft_order_side != self.entry_side
+                side = FtPrecise(-1 if is_exit else 1)
+                if tmp_amount > ZERO and tmp_price is not None:
+                    current_amount += tmp_amount * side
+                    price = avg_price if is_exit else tmp_price
+                    current_stake += price * tmp_amount * side
+
+                    if current_amount > ZERO and not is_exit:
+                        avg_price = current_stake / current_amount
+                if is_exit:
+                    # Process exits
+                    if i == ordercount and is_closing:
+                        # Apply funding fees only to the last closing order
+                        self.funding_fees = funding_fees
+                    exit_rate = o.safe_price
+                    exit_amount = o.safe_amount_after_fee
+                    prof = self.calculate_profit(exit_rate, exit_amount, float(avg_price))
+                    close_profit_abs += prof.profit_abs
+                    if total_stake > 0:
+                        # This needs to be calculated based on the last occurring exit to be aligned
+                        # with realized_profit.
+                        close_profit = (close_profit_abs / total_stake) * self.leverage
+                else:
+                    total_stake += self._calc_open_trade_value(tmp_amount, price)
+                    max_stake_amount += tmp_amount * price
+            self.funding_fees = funding_fees
+            self.max_stake_amount = float(max_stake_amount)
+
+            if close_profit:
+                self.close_profit = close_profit
+                self.realized_profit = close_profit_abs
+                self.close_profit_abs = prof.profit_abs
+            #current_amount_tr = amount_to_contract_precision(
+            #    float(current_amount), self.amount_precision, self.precision_mode, self.contract_size
+            #)
+            current_amount_tr = self.amount
+            if current_amount_tr > 0.0:
+                # Trade is still open
+                # Leverage not updated, as we don't allow changing leverage through DCA at the moment.
+                self.open_rate = price_to_precision(
+                    float(current_stake / current_amount),
+                    self.price_precision,
+                    self.precision_mode_price,
+                )
+                self.amount = current_amount_tr
+                self.stake_amount = float(current_stake) / (self.leverage or 1.0)
+                self.fee_open_cost = self.fee_open * float(self.max_stake_amount)
+                self.recalc_open_trade_value()
+                if self.stop_loss_pct is not None and self.open_rate is not None:
+                    self.adjust_stop_loss(self.open_rate, self.stop_loss_pct)
+            elif is_closing and total_stake > 0:
+                # Close profit abs / maximum owned
+                # Fees are considered as they are part of close_profit_abs
+                self.close_profit = (close_profit_abs / total_stake) * self.leverage
+                self.close_profit_abs = close_profit_abs
+        except Exception as e:
+            print(e)
+            
     def select_order_by_order_id(self, order_id: str) -> Order | None:
         """
         Finds order object by Order id.
@@ -1465,7 +1695,6 @@ class LocalTrade:
             ]
 
         return sel_trades
-
     @staticmethod
     def close_bt_trade(trade):
         LocalTrade.bt_trades_open.remove(trade)
@@ -1477,6 +1706,7 @@ class LocalTrade:
             # Must be reset at the start of every candle during backesting.
             LocalTrade.bt_open_open_trade_count_candle -= 1
         LocalTrade.bt_trades.append(trade)
+        #print(f'closing bt_trade -> {trade}')
         LocalTrade.bt_total_profit += trade.close_profit_abs
 
     @staticmethod

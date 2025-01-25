@@ -9,8 +9,8 @@ from datetime import datetime, time, timedelta, timezone
 from math import isclose
 from threading import Lock
 from time import sleep
-from typing import Any
-
+from typing import Any, Optional
+import math
 from schedule import Scheduler
 
 from freqtrade import constants
@@ -43,7 +43,7 @@ from freqtrade.exchange import (
     timeframe_to_next_date,
     timeframe_to_seconds,
 )
-from freqtrade.exchange.exchange_types import CcxtOrder
+from freqtrade.exchange.exchange_types import OrderObj
 from freqtrade.leverage.liquidation_price import update_liquidation_prices
 from freqtrade.misc import safe_value_fallback, safe_value_fallback2
 from freqtrade.mixins import LoggingMixin
@@ -68,7 +68,6 @@ from freqtrade.util import FtPrecise, MeasureTime, dt_from_ts
 from freqtrade.util.migrations.binance_mig import migrate_binance_futures_names
 from freqtrade.wallets import Wallets
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -91,6 +90,9 @@ class FreqtradeBot(LoggingMixin):
 
         # Init objects
         self.config = config
+        self.is_alpaca = self.config["exchange"]["name"] == "alpaca"
+        self.is_extended_hours =  self.config.get('extended_hours', False)
+        self.is_dry=config["dry_run"]
         exchange_config: ExchangeConfig = deepcopy(config["exchange"])
         # Remove credentials from original exchange config to avoid accidental credential exposure
         remove_exchange_credentials(config["exchange"], True)
@@ -516,85 +518,194 @@ class FreqtradeBot(LoggingMixin):
         Only used balance disappeared, which would make exiting impossible.
         :return: True if the trade was deleted, False otherwise
         """
+        
         try:
-            orders = self.exchange.fetch_orders(
-                trade.pair, trade.open_date_utc - timedelta(seconds=10)
-            )
-            prev_exit_reason = trade.exit_reason
-            prev_trade_state = trade.is_open
-            prev_trade_amount = trade.amount
-            for order in orders:
-                trade_order = [o for o in trade.orders if o.order_id == order["id"]]
-
-                if trade_order:
-                    # We knew this order, but didn't have it updated properly
-                    order_obj = trade_order[0]
-                else:
-                    logger.info(f"Found previously unknown order {order['id']} for {trade.pair}.")
-
-                    order_obj = Order.parse_from_ccxt_object(order, trade.pair, order["side"])
-                    order_obj.order_filled_date = dt_from_ts(
-                        safe_value_fallback(order, "lastTradeTimestamp", "timestamp")
+            if self.is_alpaca:
+                if self.is_dry:
+                    logger.info('fetching dry orders')
+                    orders = self.exchange.fetch_dry_orders(
+                        trade.pair, trade.open_date_utc - timedelta(seconds=10)
                     )
-                    trade.orders.append(order_obj)
-                    Trade.commit()
-                    trade.exit_reason = ExitType.SOLD_ON_EXCHANGE.value
+                    logger.info(f'Exchange orders {orders}')
+                    for order in orders:
+                        trade_order = [o for o in trade.orders if o.order_id == order["id"]]
 
-                self.update_trade_state(trade, order["id"], order, send_msg=False)
+                        if trade_order:
+                            # We knew this order, but didn't have it updated properly
+                            order_obj = trade_order[0]
+                            if order_obj['filled_at']:
+                                #need to update the trade amount
+                                logger.info('alpaca order has been filled')
+                                amount = self.exchange._api.real_amount_after_filled(order_obj['symbol'], self.is_dry)
+                                order_obj['qty'] = amount
+                                order_obj['filled_qty'] = amount
+                                order_obj = Order.parse_from_alpaca_object(order_obj, trade.pair, order_obj["side"])
+                                logger.info(f'Order object after parsing -> {order_obj}')
+                        else:
+                            logger.info(f"Found previously unknown order {order['id']} for {trade.pair}.")
+                            #here we parse from alpaca object
+                            
+                            order_obj = Order.parse_from_alpaca_object(order, trade.pair, order["side"])
+                            if order["filled_at"] is None:
+                                order_obj.order_filled_date = None
+                            else:
+                                order_obj.order_filled_date = datetime.fromtimestamp(
+                                    safe_value_fallback(order, "filled_at", "timestamp") // 1000,
+                                    tz=timezone.utc,
+                                )
 
-                logger.info(f"handled order {order['id']}")
+                            trade.orders.append(order_obj)
+                            Trade.commit()
+                            if not trade.is_open and order_obj.status == "filled":
+                                trade.exit_reason = ExitType.SOLD_ON_EXCHANGE.value
 
-            # Refresh trade from database
-            Trade.session.refresh(trade)
-            if not trade.is_open:
-                # Trade was just closed
-                trade.close_date = trade.date_last_filled_utc
-                self.order_close_notify(
-                    trade,
-                    order_obj,
-                    order_obj.ft_order_side == "stoploss",
-                    send_msg=prev_trade_state != trade.is_open,
-                )
-            else:
-                trade.exit_reason = prev_exit_reason
-                total = (
-                    self.wallets.get_owned(trade.pair, trade.base_currency)
-                    if trade.base_currency
-                    else 0
-                )
-                if total < trade.amount:
-                    if trade.fully_canceled_entry_order_count == len(trade.orders):
-                        logger.warning(
-                            f"Trade only had fully canceled entry orders. "
-                            f"Removing {trade} from database."
-                        )
+                        self.update_trade_state(trade, order["id"], order, send_msg=False)
 
-                        self._notify_enter_cancel(
+                        logger.info(f"handled order {order['id']}")
+
+                    # Refresh trade from database
+                    Trade.session.refresh(trade)
+                    if not trade.is_open:
+                        # Trade was just closed
+                        trade.close_date = trade.date_last_filled_utc
+                        self.order_close_notify(
                             trade,
-                            order_type=self.strategy.order_types["entry"],
-                            reason=constants.CANCEL_REASON["FULLY_CANCELLED"],
+                            order_obj,
+                            order_obj.ft_order_side == "stoploss",
+                            send_msg=prev_trade_state != trade.is_open,
                         )
-                        trade.delete()
-                        return True
-                    if total > trade.amount * 0.98:
-                        logger.warning(
-                            f"{trade} has a total of {trade.amount} {trade.base_currency}, "
-                            f"but the Wallet shows a total of {total} {trade.base_currency}. "
-                            f"Adjusting trade amount to {total}. "
-                            "This may however lead to further issues."
-                        )
-                        trade.amount = total
                     else:
-                        logger.warning(
-                            f"{trade} has a total of {trade.amount} {trade.base_currency}, "
-                            f"but the Wallet shows a total of {total} {trade.base_currency}. "
-                            "Refusing to adjust as the difference is too large. "
-                            "This may however lead to further issues."
+                        #the trade is open
+                        #do nothing for alpaca:
+                        pass
+                    Trade.commit()
+
+                else:
+                    #live orders
+                    orders = self.exchange.fetch_orders(
+                        trade.pair, trade.open_date_utc - timedelta(seconds=10)
+                    )
+
+                    for order in orders:
+                        trade_order = [o for o in trade.orders if o.order_id == order["id"]]
+
+                        if trade_order:
+                            # We knew this order, but didn't have it updated properly
+                            order_obj = trade_order[0]
+                        else:
+                            logger.info(f"Found previously unknown order {order['id']} for {trade.pair}.")
+                            
+                            order_obj = Order.parse_from_alpaca_object(order, trade.pair, order["side"])
+                            order_obj.order_filled_date = datetime.fromtimestamp(
+                                safe_value_fallback(order, "lastTradeTimestamp", "timestamp") // 1000,
+                                tz=timezone.utc,
+                            )
+                            trade.orders.append(order_obj)
+                            Trade.commit()
+                            trade.exit_reason = ExitType.SOLD_ON_EXCHANGE.value
+
+                        self.update_trade_state(trade, order["id"], order, send_msg=False)
+
+                        logger.info(f"handled order {order['id']}")
+
+                    # Refresh trade from database
+                    Trade.session.refresh(trade)
+                    if not trade.is_open:
+                        # Trade was just closed
+                        trade.close_date = trade.date_last_filled_utc
+                        self.order_close_notify(
+                            trade,
+                            order_obj,
+                            order_obj.ft_order_side == "stoploss",
+                            send_msg=prev_trade_state != trade.is_open,
                         )
-                if prev_trade_amount != trade.amount:
-                    # Cancel stoploss on exchange if the amount changed
-                    trade = self.cancel_stoploss_on_exchange(trade)
-            Trade.commit()
+                    else:
+                        #the trade is open
+                        #do nothing for alpaca:
+                        pass
+                    Trade.commit()
+
+                prev_exit_reason = trade.exit_reason
+                prev_trade_state = trade.is_open
+                prev_trade_amount = trade.amount
+
+
+            else:
+                orders = self.exchange.fetch_orders(
+                    trade.pair, trade.open_date_utc - timedelta(seconds=10)
+                )
+                prev_exit_reason = trade.exit_reason
+                prev_trade_state = trade.is_open
+                prev_trade_amount = trade.amount
+                for order in orders:
+                    trade_order = [o for o in trade.orders if o.order_id == order["id"]]
+
+                    if trade_order:
+                        # We knew this order, but didn't have it updated properly
+                        order_obj = trade_order[0]
+                    else:
+                        logger.info(f"Found previously unknown order {order['id']} for {trade.pair}.")
+
+                        order_obj = Order.parse_from_ccxt_object(order, trade.pair, order["side"])
+                        order_obj.order_filled_date = datetime.fromtimestamp(
+                            safe_value_fallback(order, "lastTradeTimestamp", "timestamp") // 1000,
+                            tz=timezone.utc,
+                        )
+                        trade.orders.append(order_obj)
+                        Trade.commit()
+                        trade.exit_reason = ExitType.SOLD_ON_EXCHANGE.value
+
+                    self.update_trade_state(trade, order["id"], order, send_msg=False)
+
+                    logger.info(f"handled order {order['id']}")
+
+                # Refresh trade from database
+                Trade.session.refresh(trade)
+                if not trade.is_open:
+                    # Trade was just closed
+                    trade.close_date = trade.date_last_filled_utc
+                    self.order_close_notify(
+                        trade,
+                        order_obj,
+                        order_obj.ft_order_side == "stoploss",
+                        send_msg=prev_trade_state != trade.is_open,
+                    )
+                else:
+                    trade.exit_reason = prev_exit_reason
+                    total = self.wallets.get_total(trade.base_currency) if trade.base_currency else 0
+                    if total < trade.amount:
+                        if trade.fully_canceled_entry_order_count == len(trade.orders):
+                            logger.warning(
+                                f"Trade only had fully canceled entry orders. "
+                                f"Removing {trade} from database."
+                            )
+
+                            self._notify_enter_cancel(
+                                trade,
+                                order_type=self.strategy.order_types["entry"],
+                                reason=constants.CANCEL_REASON["FULLY_CANCELLED"],
+                            )
+                            trade.delete()
+                            return True
+                        if total > trade.amount * 0.98:
+                            logger.warning(
+                                f"{trade} has a total of {trade.amount} {trade.base_currency}, "
+                                f"but the Wallet shows a total of {total} {trade.base_currency}. "
+                                f"Adjusting trade amount to {total}."
+                                "This may however lead to further issues."
+                            )
+                            trade.amount = total
+                        else:
+                            logger.warning(
+                                f"{trade} has a total of {trade.amount} {trade.base_currency}, "
+                                f"but the Wallet shows a total of {total} {trade.base_currency}. "
+                                "Refusing to adjust as the difference is too large."
+                                "This may however lead to further issues."
+                            )
+                    if prev_trade_amount != trade.amount:
+                        # Cancel stoploss on exchange if the amount changed
+                        trade = self.cancel_stoploss_on_exchange(trade)
+                Trade.commit()
 
         except ExchangeError:
             logger.warning("Error finding onexchange order.")
@@ -602,7 +713,6 @@ class FreqtradeBot(LoggingMixin):
             # catching https://github.com/freqtrade/freqtrade/issues/9025
             logger.warning("Error finding onexchange order", exc_info=True)
         return False
-
     #
     # enter positions / open trades logic and methods
     #
@@ -674,15 +784,84 @@ class FreqtradeBot(LoggingMixin):
         # get_free_open_trades is checked before create_trade is called
         # but it is still used here to prevent opening too many trades within one iteration
         if not self.get_free_open_trades():
-            logger.debug(f"Can't open a new trade for {pair}: max number of trades is reached.")
+            logger.info(f"Can't open a new trade for {pair}: max number of trades is reached.")
             return False
 
         # running get_signal on historical data fetched
         (signal, enter_tag) = self.strategy.get_entry_signal(
             pair, self.strategy.timeframe, analyzed_df
         )
-
+        
         if signal:
+            #check if alpaca extended hours trading
+            #checks if max trades have exceeded daytrading regulations
+            if self.is_alpaca:
+                required_amount_daytrade = 25000
+                balance = self.exchange.get_balances()
+                total_balance = balance['USD']['total']  # Or the relevant currency
+                logger.info(f"Available balance: ${total_balance:.2f}")
+                if total_balance < required_amount_daytrade:
+                    #retrieve the daytrade count from the account api call
+                    day_trade_count = self.exchange.get_daytrade_count()
+                    logger.info(f'the daytrade count {day_trade_count}')
+                    if day_trade_count >= 3:
+                        logger.info(f"No available day trades for this 5 day period. Daytrading limitations")
+                        return False
+                if self.strategy.is_pair_locked(pair, candle_date=nowtime, side=signal):
+                    lock = PairLocks.get_pair_longest_lock(pair, nowtime, signal)
+                    if lock:
+                        self.log_once(
+                            f"Pair {pair} {lock.side} is locked until "
+                            f"{lock.lock_end_time.strftime(constants.DATETIME_PRINT_FORMAT)} "
+                            f"due to {lock.reason}.",
+                            logger.info,
+                        )
+                    else:
+                        self.log_once(f"Pair {pair} is currently locked.", logger.info)
+                    return False
+                #check market hours
+                market_status = self.exchange.check_market_hours(self.is_extended_hours)
+                market_open, is_extended = self.is_alpaca_market_open()
+                logger.info(f"Market Open: {market_open}")
+                logger.info(f"Extended Hours: {is_extended}")
+                #only need to check for non-crypto
+                if not market_status.get("is_open") and len(pair.split('/'))==2:
+                    #is not a crypto asset coming from alpaca config
+                    logger.info(f"Market is closed for {pair}.")
+                    if self.is_extended_hours and is_extended:
+                    #check if its extended hours
+                        stake_amount = self.wallets.get_trade_stake_amount(
+                                        pair, self.config["max_open_trades"], self.edge
+                                        )
+                        logger.warning(f"Signal detected for {pair} - {signal} - {stake_amount}")
+                        bid_check_dom = self.config.get("entry_pricing", {}).get("check_depth_of_market", {})
+                        if (bid_check_dom.get("enabled", False)) and (
+                            bid_check_dom.get("bids_to_ask_delta", 0) > 0
+                        ):
+                            if self._check_depth_of_market(pair, bid_check_dom, side=signal):
+                                logger.warning(f"Checking depth of market for {pair} ...")
+                                return self.execute_entry(
+                                    pair,
+                                    stake_amount,
+                                    enter_tag=enter_tag,
+                                    is_short=(signal == SignalDirection.SHORT),
+                                    ordertype='limit'
+                                )
+                            else:
+                                return False
+                        logger.warning(f"Executing trade without checking depth of market for {pair} ...")
+                        return self.execute_entry(
+                            pair,
+                            stake_amount,
+                            enter_tag=enter_tag,
+                            is_short=(signal == SignalDirection.SHORT),
+                            ordertype = 'limit'
+                        )
+                    else:
+                        print('Market is closed, extended hours not enabled')
+                        return False
+                else:
+                    logger.info(f"Market is open for {pair}.")
             if self.strategy.is_pair_locked(pair, candle_date=nowtime, side=signal):
                 lock = PairLocks.get_pair_longest_lock(pair, nowtime, signal)
                 if lock:
@@ -698,6 +877,7 @@ class FreqtradeBot(LoggingMixin):
             stake_amount = self.wallets.get_trade_stake_amount(
                 pair, self.config["max_open_trades"], self.edge
             )
+            logger.info(f'the stake amount -> {stake_amount}')
 
             bid_check_dom = self.config.get("entry_pricing", {}).get("check_depth_of_market", {})
             if (bid_check_dom.get("enabled", False)) and (
@@ -866,14 +1046,14 @@ class FreqtradeBot(LoggingMixin):
         self,
         pair: str,
         stake_amount: float,
-        price: float | None = None,
+        price: Optional[float] = None,
         *,
         is_short: bool = False,
-        ordertype: str | None = None,
-        enter_tag: str | None = None,
-        trade: Trade | None = None,
+        ordertype: Optional[str] = None,
+        enter_tag: Optional[str] = None,
+        trade: Optional[Trade] = None,
         mode: EntryExecuteMode = "initial",
-        leverage_: float | None = None,
+        leverage_: Optional[float] = None,
     ) -> bool:
         """
         Executes an entry for the given pair
@@ -888,7 +1068,17 @@ class FreqtradeBot(LoggingMixin):
         name = "Short" if is_short else "Long"
         trade_side: LongShort = "short" if is_short else "long"
         pos_adjust = trade is not None
-
+        #first wait for the next candle before placing an order.
+        #exchange_server_time = self.exchange.get_server_time()
+        #logger.info(f"Exchange server time: {exchange_server_time}")
+        ## Get the time of the next candle open
+        ##next_candle_open = self.create_order_at_next_candle_open(exchange_server_time, timeframe_to_minutes(self.config['timeframe']))  # using 5 minute timeframe
+        #time_until_next_candle_open, time_until_next_candle_open_seconds = self.calculate_time_until_next_candle_open(exchange_server_time, timeframe_to_minutes(self.config['timeframe']))
+        ## Ensure the time difference is non-negative
+        ## Wait until the next candle's open time
+        #logger.info(f"Time difference until next candle open: {time_until_next_candle_open_seconds} seconds, next trade will execute in {time_until_next_candle_open}")
+        #time.sleep(time_until_next_candle_open_seconds)
+        
         enter_limit_requested, stake_amount, leverage = self.get_valid_enter_price_and_stake(
             pair, price, stake_amount, trade_side, enter_tag, trade, mode, leverage_
         )
@@ -901,17 +1091,37 @@ class FreqtradeBot(LoggingMixin):
             f"{stake_amount} for {trade}"
             if mode == "pos_adjust"
             else (
-                f"Replacing {side} order: about create a new order for {pair} with stake_amount: "
+                f"Replacing {side} order: about to create a new order for {pair} with stake_amount: "
                 f"{stake_amount} ..."
                 if mode == "replace"
-                else f"{name} signal found: about create a new trade for {pair} with stake_amount: "
+                else f"{name} signal found: about to create a new trade for {pair} with stake_amount: "
                 f"{stake_amount} ..."
             )
         )
         logger.info(msg)
+        print(f' Enter limit request: {enter_limit_requested}, Stake Amount: {stake_amount}, Leverage: {leverage}')
         amount = (stake_amount / enter_limit_requested) * leverage
         order_type = ordertype or self.strategy.order_types["entry"]
 
+        # Alpaca Markets doesn't support fractional shares selling short
+        # Round down the amount if its any limit ordertype
+        # Ensure that backtesting reflects this change
+
+        if self.is_alpaca and order_type == 'limit':
+            # we round down for extended hours trading
+            if len(pair.split('/')) > 2:
+                #it will be ioc
+                #might be able to place fractional short sells for crypto
+                amount=amount
+            else:
+                if amount < 1:
+                    logger.info('Not enough funds to purchase asset.')
+                    return False
+                elif amount > 1:
+                    # need to round down to near whole purchase for alpaca extended hours trading.
+                    amount = math.floor(amount)
+                    logger.info(f'Modified amount -> {amount}')
+        
         if mode == "initial" and not strategy_safe_wrapper(
             self.strategy.confirm_trade_entry, default_retval=True
         )(
@@ -926,10 +1136,8 @@ class FreqtradeBot(LoggingMixin):
         ):
             logger.info(f"User denied entry for {pair}.")
             return False
-
-        if trade and self.handle_similar_open_order(trade, enter_limit_requested, amount, side):
-            return False
-
+        
+        logger.info("Creating order...")
         order = self.exchange.create_order(
             pair=pair,
             ordertype=order_type,
@@ -941,11 +1149,12 @@ class FreqtradeBot(LoggingMixin):
             leverage=leverage,
         )
         order_obj = Order.parse_from_ccxt_object(order, pair, side, amount, enter_limit_requested)
+        #print(f'parsed from ccxt object -> {order_obj}')
         order_obj.ft_order_tag = enter_tag
         order_id = order["id"]
-        order_status = order.get("status")
+        order_status = order_obj.status
         logger.info(f"Order {order_id} was created for {pair} and status is {order_status}.")
-
+        
         # we assume the order is executed at the price requested
         enter_limit_filled_price = enter_limit_requested
         amount_requested = amount
@@ -983,12 +1192,21 @@ class FreqtradeBot(LoggingMixin):
 
         # in case of FOK the order may be filled immediately and fully
         elif order_status == "closed":
-            amount = safe_value_fallback(order, "filled", "amount", amount)
-            enter_limit_filled_price = safe_value_fallback(
-                order, "average", "price", enter_limit_requested
-            )
-
-        # Fee is applied twice because we make a LIMIT_BUY and LIMIT_SELL
+            """
+            A temporary fix until Alpaca implements real time fee returns
+            Ensure that its one bot per account trading.
+            """
+            if self.is_alpaca:
+                amount = self.exchange._api.real_amount_after_filled(pair, self.is_dry)
+                enter_limit_filled_price = safe_value_fallback(
+                    order, "average", "price", enter_limit_requested
+                )
+            else:
+                amount = safe_value_fallback(order, "filled", "amount", amount)
+                enter_limit_filled_price = safe_value_fallback(
+                    order, "average", "price", enter_limit_requested
+                )
+        
         fee = self.exchange.get_fee(symbol=pair, taker_or_maker="maker")
         base_currency = self.exchange.get_pair_base_currency(pair)
         open_date = datetime.now(timezone.utc)
@@ -1002,12 +1220,13 @@ class FreqtradeBot(LoggingMixin):
 
         # This is a new trade
         if trade is None:
-            trade = Trade(
+            if self.is_alpaca:
+                trade = Trade(
                 pair=pair,
                 base_currency=base_currency,
                 stake_currency=self.config["stake_currency"],
                 stake_amount=stake_amount,
-                amount=0,
+                amount=amount,
                 is_open=True,
                 amount_requested=amount_requested,
                 fee_open=fee,
@@ -1025,10 +1244,37 @@ class FreqtradeBot(LoggingMixin):
                 funding_fees=funding_fees,
                 amount_precision=self.exchange.get_precision_amount(pair),
                 price_precision=self.exchange.get_precision_price(pair),
-                precision_mode=self.exchange.precisionMode,
-                precision_mode_price=self.exchange.precision_mode_price,
+                precision_mode=None,
                 contract_size=self.exchange.get_contract_size(pair),
             )
+            else:
+                trade = Trade(
+                    pair=pair,
+                    base_currency=base_currency,
+                    stake_currency=self.config["stake_currency"],
+                    stake_amount=stake_amount,
+                    amount=amount,
+                    is_open=True,
+                    amount_requested=amount_requested,
+                    fee_open=fee,
+                    fee_close=fee,
+                    open_rate=enter_limit_filled_price,
+                    open_rate_requested=enter_limit_requested,
+                    open_date=open_date,
+                    exchange=self.exchange.id,
+                    strategy=self.strategy.get_strategy_name(),
+                    enter_tag=enter_tag,
+                    timeframe=timeframe_to_minutes(self.config["timeframe"]),
+                    leverage=leverage,
+                    is_short=is_short,
+                    trading_mode=self.trading_mode,
+                    funding_fees=funding_fees,
+                    amount_precision=self.exchange.get_precision_amount(pair),
+                    price_precision=self.exchange.get_precision_price(pair),
+                    precision_mode=self.exchange.precisionMode,
+                    contract_size=self.exchange.get_contract_size(pair),
+                )
+
             stoploss = self.strategy.stoploss if not self.edge else self.edge.get_stoploss(pair)
             trade.adjust_stop_loss(trade.open_rate, stoploss, initial=True)
 
@@ -1040,6 +1286,7 @@ class FreqtradeBot(LoggingMixin):
             trade.set_funding_fees(funding_fees)
 
         trade.orders.append(order_obj)
+
         trade.recalc_trade_from_orders()
         Trade.session.add(trade)
         Trade.commit()
@@ -1098,7 +1345,7 @@ class FreqtradeBot(LoggingMixin):
         Validate and eventually adjust (within limits) limit, amount and leverage
         :return: Tuple with (price, amount, leverage)
         """
-
+        print(f'price from valid price and stake {price}')
         if price:
             enter_limit_requested = price
         else:
@@ -1391,6 +1638,8 @@ class FreqtradeBot(LoggingMixin):
         Force-sells the pair (using EmergencySell reason) in case of Problems creating the order.
         :return: True if the order succeeded, and False in case of problems.
         """
+
+        print(f'creating stoploss order')
         try:
             stoploss_order = self.exchange.create_stoploss(
                 pair=trade.pair,
@@ -1479,7 +1728,7 @@ class FreqtradeBot(LoggingMixin):
 
         return False
 
-    def handle_trailing_stoploss_on_exchange(self, trade: Trade, order: CcxtOrder) -> None:
+    def handle_trailing_stoploss_on_exchange(self, trade: Trade, order: OrderObj) -> None:
         """
         Check to see if stoploss on exchange should be updated
         in case of trailing stoploss on exchange
@@ -1517,7 +1766,7 @@ class FreqtradeBot(LoggingMixin):
                         f"Could not create trailing stoploss order for pair {trade.pair}."
                     )
 
-    def manage_trade_stoploss_orders(self, trade: Trade, stoploss_orders: list[CcxtOrder]):
+    def manage_trade_stoploss_orders(self, trade: Trade, stoploss_orders: list[OrderObj]):
         """
         Perform required actions according to existing stoploss orders of trade
         :param trade: Corresponding Trade
@@ -1578,6 +1827,7 @@ class FreqtradeBot(LoggingMixin):
                     continue
 
                 fully_cancelled = self.update_trade_state(trade, open_order.order_id, order)
+                logger.info('manage open orders')
                 not_closed = order["status"] == "open" or fully_cancelled
 
                 if not_closed:
@@ -1594,7 +1844,7 @@ class FreqtradeBot(LoggingMixin):
                         self.replace_order(order, open_order, trade)
 
     def handle_cancel_order(
-        self, order: CcxtOrder, order_obj: Order, trade: Trade, reason: str
+        self, order: OrderObj, order_obj: Order, trade: Trade, reason: str
     ) -> None:
         """
         Check if current analyzed order timed out and cancel if necessary.
@@ -1647,7 +1897,7 @@ class FreqtradeBot(LoggingMixin):
             )
             trade.delete()
 
-    def replace_order(self, order: CcxtOrder, order_obj: Order | None, trade: Trade) -> None:
+    def replace_order(self, order: OrderObj, order_obj: Order | None, trade: Trade) -> None:
         """
         Check if current analyzed entry order should be replaced or simply cancelled.
         To simply cancel the existing order(no replacement) adjust_entry_price() should return None
@@ -1796,7 +2046,7 @@ class FreqtradeBot(LoggingMixin):
     def handle_cancel_enter(
         self,
         trade: Trade,
-        order: CcxtOrder,
+        order: OrderObj,
         order_obj: Order,
         reason: str,
         replacing: bool | None = False,
@@ -1881,7 +2131,7 @@ class FreqtradeBot(LoggingMixin):
         return was_trade_fully_canceled
 
     def handle_cancel_exit(
-        self, trade: Trade, order: CcxtOrder, order_obj: Order, reason: str
+        self, trade: Trade, order: OrderObj, order_obj: Order, reason: str
     ) -> bool:
         """
         exit order cancel - cancel order and update trade
@@ -1890,8 +2140,12 @@ class FreqtradeBot(LoggingMixin):
         order_id = order_obj.order_id
         cancelled = False
         # Cancelled orders may have the status of 'canceled' or 'closed'
+        if self.is_alpaca:
+            amount = order["filled_qty"]
+        else:
+            amount = order["amount"]
         if order["status"] not in constants.NON_OPEN_EXCHANGE_STATES:
-            filled_amt: float = order.get("filled", 0.0) or 0.0
+            filled_amt: float = order.get("filled_qty", 0.0) or 0.0 if self.is_alpaca else order.get("filled", 0.0) or 0.0
             # Filled val is in quote currency (after leverage)
             filled_rem_stake = trade.stake_amount - (filled_amt * trade.open_rate / trade.leverage)
             minstake = self.exchange.get_min_pair_stake_amount(
@@ -1906,13 +2160,12 @@ class FreqtradeBot(LoggingMixin):
                         f"the filled amount of {filled_amt} would result in an unexitable trade."
                     )
                     reason = constants.CANCEL_REASON["PARTIALLY_FILLED_KEEP_OPEN"]
-
                     self._notify_exit_cancel(
                         trade,
                         order_type=self.strategy.order_types["exit"],
                         reason=reason,
                         order_id=order["id"],
-                        sub_trade=trade.amount != order["amount"],
+                        sub_trade=trade.amount != amount,
                     )
                     return False
             order_obj.ft_cancel_reason = reason
@@ -1951,7 +2204,7 @@ class FreqtradeBot(LoggingMixin):
             order_type=self.strategy.order_types["exit"],
             reason=order_obj.ft_cancel_reason,
             order_id=order["id"],
-            sub_trade=trade.amount != order["amount"],
+            sub_trade=trade.amount != amount,
         )
         return cancelled
 
@@ -2008,6 +2261,127 @@ class FreqtradeBot(LoggingMixin):
         :param exit_check: CheckTuple with signal and reason
         :return: True if it succeeds False
         """
+        
+        if self.is_alpaca:
+            logger.info('performing trade exit for alpaca')
+            #check the market hours for a trade exit
+            market_status = self.exchange.check_market_hours(self.is_extended_hours)
+            pair = trade.pair
+            #only need to check for non-crypto
+            if not market_status.get("is_open") and len(pair.split('/'))==2:
+                #is not a crypto asset coming from alpaca config
+                logger.info(f"Market is closed for {pair}.")
+                if self.is_extended_hours and is_extended:
+                    logger.info(f"Extended hours open for {pair}.")
+                else:
+                    print('Market is closed, extended hours not enabled')
+                    return False
+            else:
+                logger.info(f"Market is open for {pair}.")
+
+            required_amount_daytrade = 25000
+            #check daytrading limitations
+            balance = self.exchange.get_balances()
+            available_balance = balance['USD']['total']  # Or the relevant currency
+            logger.info(f"Available balance: ${available_balance:.2f}")
+            if available_balance < required_amount_daytrade:
+                #retrieve the daytrade count from the account api call
+                day_trade_count = self.exchange.get_daytrade_count()
+                logger.info(f'the daytrade count {day_trade_count}')
+                if day_trade_count >= 3:
+                    logger.info(f"No available day trades for this 5 day period. Daytrading limitations")
+                    return False
+
+            exit_type = "exit"
+            exit_reason = exit_tag or exit_check.exit_reason
+            if exit_check.exit_type in (
+                ExitType.STOP_LOSS,
+                ExitType.TRAILING_STOP_LOSS,
+                ExitType.LIQUIDATION,
+            ):
+                exit_type = "stoploss"
+            # set custom_exit_price if available
+            proposed_limit_rate = limit
+            current_profit = trade.calc_profit_ratio(limit)
+            custom_exit_price = strategy_safe_wrapper(
+                self.strategy.custom_exit_price, default_retval=proposed_limit_rate
+            )(
+                pair=trade.pair,
+                trade=trade,
+                current_time=datetime.now(timezone.utc),
+                proposed_rate=proposed_limit_rate,
+                current_profit=current_profit,
+                exit_tag=exit_reason,
+            )
+
+            limit = self.get_valid_price(custom_exit_price, proposed_limit_rate)
+
+            # First cancelling stoploss on exchange ...
+            trade = self.cancel_stoploss_on_exchange(trade)
+
+            order_type = ordertype or self.strategy.order_types[exit_type]
+            if exit_check.exit_type == ExitType.EMERGENCY_EXIT:
+                # Emergency sells (default to market!)
+                order_type = self.strategy.order_types.get("emergency_exit", "market")
+
+            amount = self._safe_exit_amount(trade, trade.pair, sub_trade_amt or trade.amount)
+
+
+            time_in_force = self.strategy.order_time_in_force["exit"]
+
+            if (
+                exit_check.exit_type != ExitType.LIQUIDATION
+                and not sub_trade_amt
+                and not strategy_safe_wrapper(self.strategy.confirm_trade_exit, default_retval=True)(
+                    pair=trade.pair,
+                    trade=trade,
+                    order_type=order_type,
+                    amount=amount,
+                    rate=limit,
+                    time_in_force=time_in_force,
+                    exit_reason=exit_reason,
+                    sell_reason=exit_reason,  # sellreason -> compatibility
+                    current_time=datetime.now(timezone.utc),
+                )
+            ):
+                logger.info(f"User denied exit for {trade.pair}.")
+                return False
+            try:
+                # Execute sell and update trade record
+                order = self.exchange.create_order(
+                    pair=trade.pair,
+                    ordertype=order_type,
+                    side=trade.exit_side,
+                    amount=amount,
+                    rate=limit,
+                    leverage=trade.leverage,
+                    reduceOnly=self.trading_mode == TradingMode.FUTURES,
+                    time_in_force=time_in_force,
+                )
+            except InsufficientFundsError as e:
+                logger.warning(f"Unable to place order {e}.")
+                # Try to figure out what went wrong
+                self.handle_insufficient_funds(trade)
+                return False
+            
+            order_obj = Order.parse_from_ccxt_object(order, trade.pair, trade.exit_side, amount, limit)
+
+            order_obj.ft_order_tag = exit_reason
+            trade.orders.append(order_obj)
+
+            trade.exit_order_status = ""
+            trade.close_rate_requested = limit
+            trade.exit_reason = exit_reason
+
+            self._notify_exit(trade, order_type, sub_trade=bool(sub_trade_amt), order=order_obj)
+            # In case of market sell orders the order can be closed immediately
+
+            if order.get("status", "unknown") in ("closed", "expired"):
+                self.update_trade_state(trade, order_obj.order_id, order)
+
+            Trade.commit()
+            return True
+        
         trade.set_funding_fees(
             self.exchange.get_funding_fees(
                 pair=trade.pair,
@@ -2131,14 +2505,15 @@ class FreqtradeBot(LoggingMixin):
         if sub_trade and order is not None:
             amount = order.safe_filled if fill else order.safe_amount
             order_rate: float = order.safe_price
-
             profit = trade.calculate_profit(order_rate, amount, trade.open_rate)
         else:
             order_rate = trade.safe_close_rate
             profit = trade.calculate_profit(rate=order_rate)
             amount = trade.amount
         gain: ProfitLossStr = "profit" if profit.profit_ratio > 0 else "loss"
-
+        #logger.debug(f'amount {amount}')
+        #logger.debug(f'trade amount {trade.amount}')
+        #logger.debug(f'safe_filled {order.safe_filled}, order safe amount -> {order.safe_amount}')
         msg: RPCExitMsg = {
             "type": (RPCMessageType.EXIT_FILL if fill else RPCMessageType.EXIT),
             "trade_id": trade.id,
@@ -2243,7 +2618,7 @@ class FreqtradeBot(LoggingMixin):
         self,
         trade: Trade,
         order_id: str | None,
-        action_order: CcxtOrder | None = None,
+        action_order: OrderObj | None = None,
         *,
         stoploss_order: bool = False,
         send_msg: bool = True,
@@ -2265,9 +2640,23 @@ class FreqtradeBot(LoggingMixin):
         if not stoploss_order:
             logger.info(f"Found open order for {trade}")
         try:
-            order = action_order or self.exchange.fetch_order_or_stoploss_order(
-                order_id, trade.pair, stoploss_order
-            )
+            #need to check this on the buy order
+            orders = trade.orders
+            _buy = [x for x in orders if x.ft_order_side=='buy'][0]
+            if self.is_alpaca and _buy.ft_is_open:
+                order = self.exchange._api.fetch_order(order_id) if not self.is_dry else self.exchange._api.fetch_dry_order(order_id)
+                if order['filled_at']:
+                    #need to update the trade amount
+                    logger.info('alpaca order has been filled')
+                    amount = self.exchange._api.real_amount_after_filled(trade.pair, self.is_dry)
+                    order['qty'] = amount
+                    order['filled_qty'] = amount
+                    logger.info(f'Order object after filled -> {order}')
+            else:
+                order = action_order or self.exchange.fetch_order_or_stoploss_order(
+                    order_id, trade.pair, stoploss_order
+                )
+            #logger.info(f'the order when updating {order}')
         except InvalidOrderException as exception:
             logger.warning("Unable to fetch order %s: %s", order_id, exception)
             return False
@@ -2281,9 +2670,7 @@ class FreqtradeBot(LoggingMixin):
 
         order_obj_or_none = trade.select_order_by_order_id(order_id)
         order_obj = self.order_obj_or_raise(order_id, order_obj_or_none)
-
-        self.handle_order_fee(trade, order_obj, order)
-
+        self.handle_order_fee(trade,order_obj,order)
         trade.update_trade(order_obj, not send_msg)
 
         trade = self._update_trade_after_fill(trade, order_obj, send_msg)
@@ -2407,8 +2794,18 @@ class FreqtradeBot(LoggingMixin):
             logger.info(f"Applying fee on amount for {trade}, fee={fee_abs}.")
             return fee_abs
         return None
-
-    def handle_order_fee(self, trade: Trade, order_obj: Order, order: CcxtOrder) -> None:
+    #def handle_alpaca_order_fee(self,trade:Trade,order_obj:Order, order:OrderObj) -> None:
+    #    try:
+    #        pair = trade.pair
+    #        order_type = order_obj.order_type
+    #        taker_or_maker = 'maker' if order_type =='limit' else 'taker'
+    #        #self, pair, taker_or_maker='taker', dry=False, is_backtest=True
+    #        #fee_abs = self.exchange._api.get_fee(pair=pair, taker_or_maker=taker_or_maker, dry=self.is_dry, is_backtest=False)
+    #        if fee_abs is not None:
+    #            order_obj.ft_fee_base = fee_abs
+    #    except DependencyException as exception:
+    #        logger.warning("Could not update trade amount: %s", exception)
+    def handle_order_fee(self, trade: Trade, order_obj: Order, order: OrderObj) -> None:
         # Try update amount (binance-fix)
         try:
             fee_abs = self.get_real_amount(trade, order, order_obj)
@@ -2417,7 +2814,7 @@ class FreqtradeBot(LoggingMixin):
         except DependencyException as exception:
             logger.warning("Could not update trade amount: %s", exception)
 
-    def get_real_amount(self, trade: Trade, order: CcxtOrder, order_obj: Order) -> float | None:
+    def get_real_amount(self, trade: Trade, order: OrderObj, order_obj: Order) -> float | None:
         """
         Detect and update trade fee.
         Calls trade.update_fee() upon correct detection.
@@ -2426,7 +2823,15 @@ class FreqtradeBot(LoggingMixin):
         :return: Absolute fee to apply for this order or None
         """
         # Init variables
-        order_amount = safe_value_fallback(order, "filled", "amount")
+        print(f'get real amount -> {order}')
+        if not self.is_alpaca:
+            order_amount = safe_value_fallback(order, "filled", "amount")
+        else:
+            if not order['filled_at']:
+                #order isn't filled yet
+                return None
+            else:
+                order_amount = safe_value_fallback(order, "filled_qty", "qty")
         # Only run for closed orders
         if (
             trade.fee_updated(order.get("side", ""))
@@ -2434,7 +2839,7 @@ class FreqtradeBot(LoggingMixin):
             or order_obj.ft_fee_base
         ):
             return None
-
+        print(f'the order amount -> {order_amount}')
         trade_base_currency = self.exchange.get_pair_base_currency(trade.pair)
         # use fee from order-dict if possible
         if self.exchange.order_has_fee(order):
@@ -2449,8 +2854,10 @@ class FreqtradeBot(LoggingMixin):
                 # Reject all fees that report as > 2%.
                 # These are most likely caused by a parsing bug in ccxt
                 # due to multiple trades (https://github.com/ccxt/ccxt/issues/8025)
+                logger.info(f'fee rate is None or fee_rate < 0.02 -> {fee_rate}')
                 trade.update_fee(fee_cost, fee_currency, fee_rate, order.get("side", ""))
                 if trade_base_currency == fee_currency:
+                    logger.info(f'trade_base_currency == fee_currency -> {trade_base_currency}, {fee_currency}')
                     # Apply fee to amount
                     return self.apply_fee_conditional(
                         trade,
@@ -2459,7 +2866,28 @@ class FreqtradeBot(LoggingMixin):
                         fee_abs=fee_cost,
                         order_obj=order_obj,
                     )
-                return None
+                #if self.is_alpaca:
+                #    logger.info('is alpaca')
+                #    logger.info(f'the ordertype -> {order["order_type"]}')
+                #    logger.info(f'the fee -> {fee_rate}')
+                #    logger.info(f'the order -> {order}')
+                #    #debugging
+                #    filled_qty = order['filled_qty']
+                #    filled_avg_price = order['filled_avg_price']
+                #    cost = filled_qty*filled_avg_price
+                #    diff = cost * fee_rate
+                #    order_cost = cost - diff
+                #    amnt = order_cost/filled_avg_price
+                #    return_diff = filled_qty - amnt
+                #    logger.info(f'the amnt -> {amnt}')
+                #    trade.amount = amnt
+                #    return return_diff
+                    
+                else:
+                    return None
+
+
+
         return self.fee_detection_from_trades(
             trade, order, order_obj, order_amount, order.get("trades", [])
         )
@@ -2477,12 +2905,14 @@ class FreqtradeBot(LoggingMixin):
         return True
 
     def fee_detection_from_trades(
-        self, trade: Trade, order: CcxtOrder, order_obj: Order, order_amount: float, trades: list
+        self, trade: Trade, order: OrderObj, order_obj: Order, order_amount: float, trades: list
     ) -> float | None:
         """
         fee-detection fallback to Trades.
         Either uses provided trades list or the result of fetch_my_trades to get correct fee.
         """
+
+
         if not self._trades_valid_for_fee(trades):
             trades = self.exchange.get_trades_for_order(
                 self.exchange.get_order_id_conditional(order), trade.pair, order_obj.order_date
@@ -2557,3 +2987,79 @@ class FreqtradeBot(LoggingMixin):
 
         # Bracket between min_custom_price_allowed and max_custom_price_allowed
         return max(min(valid_custom_price, max_custom_price_allowed), min_custom_price_allowed)
+
+
+    def is_alpaca_market_open(self):
+        """
+        Check if the current time is within market trading hours (Eastern Time).
+
+        Market hours:
+        - Regular trading hours: 9:30am - 4:00pm ET, Monday to Friday
+        - Pre-market: 4:00am - 9:30am ET
+        - After-hours: 4:00pm - 8:00pm ET
+
+        Returns:
+        - bool: True if within market hours (including pre-market and after-hours)
+        - bool: True if within extended hours (pre-market or after-hours)
+        """
+        # Get current time in Eastern Time (using datetime's built-in methods)
+        current_time = datetime.now()
+
+        # Check if it's a weekday (Monday = 0, Friday = 4)
+        if current_time.weekday() > 4:
+            return False, False
+
+        # Convert current time to time object for easier comparison
+        current_time_only = current_time.time()
+
+        # Define market hour boundaries
+        market_open = time(9, 30)
+        market_close = time(16, 0)
+        pre_market_start = time(4, 0)
+        pre_market_end = market_open
+        after_hours_start = market_close
+        after_hours_end = time(20, 0)
+
+        # Check if within regular market hours
+        is_regular_market = market_open <= current_time_only < market_close
+
+        # Check if within extended hours
+        is_pre_market = pre_market_start <= current_time_only < pre_market_end
+        is_after_hours = after_hours_start <= current_time_only < after_hours_end
+        is_extended_hours = is_pre_market or is_after_hours
+
+        return is_regular_market or is_extended_hours, is_extended_hours
+
+
+    def is_extended_hours(self, current_time: datetime = None) -> bool:
+        """
+        Check if the current time is within extended trading hours.
+        Extended hours: 4:00 AM to 9:30 AM and 4:00 PM to 8:00 PM Eastern Time, weekdays only.
+        """
+        if current_time is None:
+            current_time = datetime.now(tz.tzutc())
+        
+        # Ensure the time is in UTC
+        current_time = self.ensure_utc_time(current_time)
+        
+        # Convert to Eastern Time
+        et_tz = tz.gettz('America/New_York')
+        et_time = current_time.astimezone(et_tz)
+        
+        # Check if it's a weekday
+        if et_time.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
+            return False
+        
+        et_time = et_time.time()
+        
+        # Define extended hours ranges
+        pre_market_start = time(4, 0)
+        pre_market_end = time(9, 30)
+        after_market_start = time(16, 0)
+        after_market_end = time(20, 0)
+        
+        # Check if current time is within extended hours
+        is_pre_market = pre_market_start <= et_time < pre_market_end
+        is_after_market = after_market_start <= et_time < after_market_end
+        
+        return is_pre_market, is_after_market

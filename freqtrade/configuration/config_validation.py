@@ -65,6 +65,7 @@ def validate_config_schema(conf: dict[str, Any], preliminary: bool = False) -> d
         FreqtradeValidator(conf_schema).validate(conf)
         return conf
     except ValidationError as e:
+        logger.info(f'Validation error')
         logger.critical(f"Invalid configuration. Reason: {e}")
         raise ValidationError(best_match(Draft4Validator(conf_schema).iter_errors(conf)).message)
 

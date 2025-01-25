@@ -9,6 +9,10 @@ import traceback
 import re
 from queue import Queue
 
+
+from freqtrade.enums import (
+    RunMode
+)
 import requests
 import aiohttp
 import pandas as pd
@@ -33,7 +37,6 @@ class AlpacaWebSocket:
         self.data_crypto = {}
         self.data_queue_crypto = Queue()  # Queue to store received data
         #self.websocket_url="wss://stream.data.alpaca.markets/v2/test"
-        self.logger = logging.getLogger(__name__)
         self.connected = False  # Flag to indicate WebSocket connection status
         self.websocket = None  # To store the websocket object
         self.websocket_stocks = None  # To store the websocket object
@@ -46,7 +49,6 @@ class AlpacaWebSocket:
         """
         Process incoming data and store it in a structured format.
         """
-        print(data)
         for item in data:
             symbol = item.get('S')
             if symbol:
@@ -59,13 +61,12 @@ class AlpacaWebSocket:
         Get all available data
         Either from queue or self.data
         """
-        print(self.data)
         return self.data
 
     async def stream_crypto(self, session_crypto):
         async with session_crypto.ws_connect(self.crypto_websocket_url) as websocket_crypto:
             try:
-                print(f'Connected to {self.crypto_websocket_url}')
+                logger.info(f'Connected to {self.crypto_websocket_url}')
                 self.websocket_crypto = websocket_crypto
                 self.connected = True  # Set the connection status to True
                 to_watch_crypto = []
@@ -75,18 +76,16 @@ class AlpacaWebSocket:
                     if len(parts) > 2:
                         base, quote = parts[0] + "/" + parts[1], parts[2]
                         to_watch_crypto.append(base)
-                        print(to_watch_crypto)
                     
                 #to_watch = [pair.split('/')[0] for pair in self.config["exchange"]["pair_whitelist"]]
-                print('to watch:', to_watch_crypto)
+                logger.info(f'to watch: {str(to_watch_crypto)}')
                 subscribe_message = {
                     "action": "subscribe",
                     "bars": to_watch_crypto
                 }
                 await websocket_crypto.send_json(subscribe_message)
-                print("Subscribed to channels")
                 self.data_queue_crypto.put("Subscribed to channels")
-                logging.info("Subscribed to channels")
+                logger.info("Subscribed to channels")
 
                 async for message in websocket_crypto:
                     data_crypto = json.loads(message.data)
@@ -94,13 +93,13 @@ class AlpacaWebSocket:
                     self.data_queue_crypto.put(data_crypto)  # Put received data into the queue
                     self._process_data(data_crypto)
             except Exception as e:
-                print(e)
+                logger.warning(e)
                 self.connected=False
 
     async def stream_stocks(self, session_stock):
         async with session_stock.ws_connect(self.websocket_url) as websocket_stock:
             try:
-                print(f'Connected to {self.websocket_url}')
+                logger.info(f'Connected to {self.websocket_url}')
                 self.websocket = websocket_stock
                 self.connected = True  # Set the connection status to True
                 to_watch = []
@@ -112,15 +111,15 @@ class AlpacaWebSocket:
                         to_watch.append(base)
                     
                 #to_watch = [pair.split('/')[0] for pair in self.config["exchange"]["pair_whitelist"]]
-                print('to watch:', to_watch)
+                logger.info(f'to watch: {str(to_watch)}')
                 subscribe_message = {
                     "action": "subscribe",
                     "bars": to_watch
                 }
                 await websocket_stock.send_json(subscribe_message)
-                print("Subscribed to channels")
+                logger.info("Subscribed to channels")
                 self.data_queue.put("Subscribed to channels")
-                logging.info("Subscribed to channels")
+                logger.info("Subscribed to channels")
 
                 async for message in websocket_stock:
                     data = json.loads(message.data)
@@ -128,38 +127,37 @@ class AlpacaWebSocket:
                     self.data_queue.put(data)  # Put received data into the queue
                     self._process_data(data)
             except Exception as e:
-                print(e)
+                logger.warning(e)
                 self.connected=False
 
     async def _start_websocket(self):
         if self.connected:
             return  # If already connected, do nothing
         #create flags
-        stocks_and_crypto = False
-        has_crypto = False
-        crypto_only = False
-        has_stocks = False
-        stocks_only = False
+        self.stocks_and_crypto = False
+        self.has_crypto = False
+        self.crypto_only = False
+        self.has_stocks = False
+        self.stocks_only = False
         for pair in self.config["exchange"]["pair_whitelist"]:
             parts = pair.split('/')
             #its crypto
             if len(parts) >= 2:
                 #crypto included
-                has_crypto = True
+                self.has_crypto = True
             if len(parts) == 2:
-                has_stocks = True
+                self.has_stocks = True
         
-        if has_crypto and has_stocks:
+        if self.has_crypto and self.has_stocks:
             #need both websockets
-            stocks_and_crypto=True
-        elif has_crypto and not has_stocks:
-            crypto_only=True
-        elif has_stocks and not has_crypto:
-            stocks_only=True
+            self.stocks_and_crypto=True
+        elif self.has_crypto and not self.has_stocks:
+            self.crypto_only=True
+        elif self.has_stocks and not self.has_crypto:
+            self.stocks_only=True
         #need simultaneous websockets
         #it might throw an error that simultaneous websockets are open...
-        if stocks_and_crypto:
-            print('flag true')
+        if self.stocks_and_crypto:
             #crypto instance
             #need a seperate account to run simultaneous websockets
             cheaders = {
@@ -167,15 +165,18 @@ class AlpacaWebSocket:
                 "APCA-API-SECRET-KEY": self.config['exchange']['paper_secret_2']
             }
             async with aiohttp.ClientSession(headers=cheaders) as session_crypto, aiohttp.ClientSession(headers=self.headers) as session_stock:
-                crypto_task = asyncio.create_task(self.stream_crypto(session_crypto))
-                stock_task = asyncio.create_task(self.stream_stocks(session_stock))
+                self.session_crypto = session_crypto
+                self.session_stock = session_stock
+                crypto_task = asyncio.create_task(self.stream_crypto(self.session_crypto))
+                stock_task = asyncio.create_task(self.stream_stocks(self.session_stock))
                 await asyncio.gather(crypto_task, stock_task)
 
-        if stocks_only:
+        if self.stocks_only:
             async with aiohttp.ClientSession(headers=self.headers) as session:
                 async with session.ws_connect(self.websocket_url) as websocket:
                     try:
-                        print(f'Connected to {self.websocket_url}')
+                        self.session = session
+                        logger.info(f'Connected to {self.websocket_url}')
                         self.websocket = websocket
                         self.connected = True  # Set the connection status to True
                         to_watch = []
@@ -187,29 +188,28 @@ class AlpacaWebSocket:
                                 to_watch.append(base)
                             
                         #to_watch = [pair.split('/')[0] for pair in self.config["exchange"]["pair_whitelist"]]
-                        print('to watch:', to_watch)
+                        logger.info(f'to watch: {str(to_watch)}')
                         subscribe_message = {
                             "action": "subscribe",
                             "bars": to_watch
                         }
                         await websocket.send_json(subscribe_message)
-                        print("Subscribed to channels")
+                        logger.info("Subscribed to channels")
                         self.data_queue.put("Subscribed to channels")
-                        logging.info("Subscribed to channels")
-
                         async for message in websocket:
                             data = json.loads(message.data)
                             #organize by the symbol and append to the data dictionary
                             self.data_queue.put(data)  # Put received data into the queue
                             self._process_data(data)
                     except Exception as e:
-                        print(e)
+                        logger.warning(e)
                         self.connected=False
-        if crypto_only:
+        if self.crypto_only:
             async with aiohttp.ClientSession(headers=self.headers) as session:
                 async with session.ws_connect(self.crypto_websocket_url) as websocket_crypto: 
                     try:
-                        print(f'Connected to {self.crypto_websocket_url}')
+                        self.session = session
+                        logger.info(f'Connected to {self.crypto_websocket_url}')
                         self.websocket_crypto = websocket_crypto
                         self.connected = True  # Set the connection status to True
                         to_watch_crypto = []
@@ -221,15 +221,15 @@ class AlpacaWebSocket:
                                 to_watch_crypto.append(base)
                             
                         #to_watch = [pair.split('/')[0] for pair in self.config["exchange"]["pair_whitelist"]]
-                        print('to watch:', to_watch_crypto)
+                        logger.info(f'to watch: {str(to_watch_crypto)}')
                         subscribe_message = {
                             "action": "subscribe",
                             "bars": to_watch_crypto
                         }
                         await websocket_crypto.send_json(subscribe_message)
-                        print("Subscribed to channels")
+                        logger.info("Subscribed to channels")
                         self.data_queue_crypto.put("Subscribed to channels")
-                        logging.info("Subscribed to channels")
+                        logger.info("Subscribed to channels")
 
                         async for message in websocket_crypto:
                             data = json.loads(message.data)
@@ -237,19 +237,25 @@ class AlpacaWebSocket:
                             self.data_queue_crypto.put(data)  # Put received data into the queue
                             self._process_data(data)
                     except Exception as e:
-                        print(e)
+                        logger.warning(e)
                         self.connected=False
     
     async def close_websocket(self):
         if self.connected:
-            if self.websocket:
-                await self.websocket.close()
-            if self.websocket_stocks:
-                self.websocket_stocks.close()
-            if self.websocket_crypto:
-                self.websocker_crypto.close()
+            if self.stocks_only:
+                #await self.websocket.close()
+                await self.session.close()
+            if self.crypto_only:
+                #await self.websocket_crypto.close()
+                await self.session.close()
+            if self.stocks_and_crypto:
+                #await self.websocket.close()
+                #await self.websocket_crypto.close()
+                await self.session_crypto.close()
+                await self.session_stock.close()
             self.connected = False
-            self.logger.info("WebSocket closed")
+            logger.info("WebSocket closed")
+
 class Alpaca:
     _params: Dict = {"trading_agreement": "agree"}
     _ft_has: Dict = {
@@ -272,34 +278,48 @@ class Alpaca:
         # (TradingMode.FUTURES, MarginMode.CROSS)
     ]
 
-    def __init__(self, config: Dict[str, Any]) -> None:
+    def __init__(self, config: Dict[str, Any], validate=False) -> None:
         #super().__init__(config)
-        self._ft_has = {}  # This dictionary can hold overrides for exchange_has
+        self._ft_has = {
+            "stoploss_on_exchange": True,
+            "stop_price_param": "stopLossPrice",
+            "stop_price_prop": "stopLossPrice",
+            "stoploss_order_types": {"limit": "limit", "market": "market"},
+            "order_time_in_force": ["DAY", "GTC", "IOC", "PO"],
+            "ohlcv_candle_limit": 1000,
+            "ohlcv_has_history": True,
+            "trades_pagination": "id",
+            "trades_pagination_arg": "since",
+            "trades_pagination_overlap": False,
+            "mark_ohlcv_timeframe": "4h",
+        }
         self.name = "alpaca"
         self.id = "alpaca"
+        self.config = config
+        self.is_dry = config['dry_run']
+        self.is_extended_hours = config.get("extended_hours", False)
         self.default_spread_percentage = 0.01
         self.base_url = "https://broker-api.alpaca.markets"
         self.paper_url = "https://paper-api.alpaca.markets"
         self.market_url = "https://data.alpaca.markets/v2/stocks/bars"
         self.market_url_ = "https://data.alpaca.markets"
         self.live_url = "https://api.alpaca.markets"
-        self.paper_key = config['exchange']['paper_key']
-        self.paper_secret = config['exchange']['paper_secret']
+        self.paper_key = config['exchange'].get('paper_key', None)
+        self.paper_secret = config['exchange'].get('paper_secret', None)
         self.market_key = config['exchange'].get('mkey', None)
         self.market_secret = config['exchange'].get('msecret', None)
         self.api_key = config['exchange']['key']
         self.api_secret = config['exchange']['secret']
         self.account_id = config['exchange']['account_id']
-
-        self.headers = {
-            'accept': 'application/json',
-            'APCA-API-KEY-ID': self.paper_key,
-            'APCA-API-SECRET-KEY': self.paper_secret,
-        }
-        self.mheaders = {
+        self.paper_headers = {
             'accept': 'application/json',
             'APCA-API-KEY-ID': self.paper_key,
             'APCA-API-SECRET-KEY': self.paper_secret
+        }
+        self.live_headers = {
+            'accept': 'application/json',
+            'APCA-API-KEY-ID': self.market_key,
+            'APCA-API-SECRET-KEY': self.market_secret
         }
         
     @property
@@ -412,16 +432,16 @@ class Alpaca:
             #get crypto and us equities
             l=[]
             url = f"{self.paper_url}/v2/assets?asset_class=us_equity"
-            response = requests.get(url, headers=self.mheaders, timeout=30)
-            #print(f"Response Status Code: {response.status_code}")
-            #print(f"Response Text: {response.text}")
+            response = requests.get(url, headers=self.paper_headers, timeout=30)
+            #logger.info(f"Response Status Code: {response.status_code}")
+            #logger.info(f"Response Text: {response.text}")
             response.raise_for_status()  # Raise an error if the request was not successful
             l.extend(response.json())
 
             url = f"{self.paper_url}/v2/assets?asset_class=crypto"
-            response = requests.get(url, headers=self.mheaders, timeout=30)
-            #print(f"Response Status Code: {response.status_code}")
-            #print(f"Response Text: {response.text}")
+            response = requests.get(url, headers=self.paper_headers, timeout=30)
+            #logger.info(f"Response Status Code: {response.status_code}")
+            #logger.info(f"Response Text: {response.text}")
             response.raise_for_status()  # Raise an error if the request was not successful
             l.extend(response.json())
             return l
@@ -442,8 +462,6 @@ class Alpaca:
                     min_trade_increment = asset.get('min_trade_increment', '0.000000001')  # Default value
                     min_order_size = asset.get('min_order_size', '1.0')  # Default value
                     price_increment = asset.get('price_increment', '0.01')  # Default value
-                    if 'BTC' in markets_key:
-                        print(markets_key)
                     markets[markets_key] = {
                         'id': asset['id'],
                         'asset_class' : asset['class'],
@@ -640,17 +658,16 @@ class Alpaca:
         missing_intervals = self.check_intervals(filled_bars_data, interval_ms)
 
         if missing_intervals:
-            print("Missing intervals found")
+            logger.warning("Missing intervals found")
             for timestamp in missing_intervals:
-                print(f"Missing interval at: {datetime.utcfromtimestamp(timestamp / 1000).strftime('%Y-%m-%d %H:%M:%S')}")
+                logger.warning(f"Missing interval at: {datetime.utcfromtimestamp(timestamp / 1000).strftime('%Y-%m-%d %H:%M:%S')}")
             return missing_intervals
         else:
-            print("No missing intervals found. All intervals are accounted for.")
+            logger.info("No missing intervals found. All intervals are accounted for.")
             return []
 
     def generate_missing_candles(self, bars_data, symbol, timeframe):
         """Function - Generate missing candles, used by fetch ohlcv for after market hours"""
-        #print(f'the length of the bars data from api return {len(bars_data)}')
         if not bars_data:
             return []
         
@@ -722,6 +739,9 @@ class Alpaca:
     ):
         """Function - fetch crypto ticker from alpaca api"""
         try:
+            parts = symbol.split('/')
+            if len(parts) > 2:
+                symbol = parts[0] + '/' + parts[1]
             url = self.market_url_ + f'/v1beta3/crypto/us/latest/quotes?symbols={str(symbol).replace("/", "%2F")}'
 
             headers = {
@@ -742,13 +762,13 @@ class Alpaca:
             if ask_price == 0:
                 if bid_price > 0:
                     ask_price = bid_price * (1 + self.default_spread_percentage)
-                    logger.debug('Adjusted ask price using bid price: %s', ask_price)
+                    logger.info('Adjusted ask price using bid price: %s', ask_price)
                 else:
                     logger.warning('Both bid price and ask price are 0. Cannot adjust ask price.')
 
             # Log the extracted bid and ask prices
-            logger.debug('Extracted bid price: %s', bid_price)
-            logger.debug('Extracted ask price: %s', ask_price)
+            #logger.info('Extracted bid price: %s', bid_price)
+            #logger.info('Extracted ask price: %s', ask_price)
 
             #now get the last price:
             url = self.market_url_ + f'/v1beta3/crypto/us/latest/trades?symbols={str(symbol).replace("/", "%2F")}'
@@ -791,7 +811,7 @@ class Alpaca:
     def fetch_alpaca_ticker(
         self,
         symbol: str,
-        params: dict[str, Any] = None #default to None
+        params: Dict[str, Any] = None #default to None
     ):
         """Function - fetch alpaca ticker for input symbol"""
         try:
@@ -812,13 +832,13 @@ class Alpaca:
             if ask_price == 0:
                 if bid_price > 0:
                     ask_price = bid_price * (1 + self.default_spread_percentage)
-                    logger.debug('Adjusted ask price using bid price: %s', ask_price)
+                    logger.info('Adjusted ask price using bid price: %s', ask_price)
                 else:
                     logger.warning('Both bid price and ask price are 0. Cannot adjust ask price.')
 
             # Log the extracted bid and ask prices
-            logger.debug('Extracted bid price: %s', bid_price)
-            logger.debug('Extracted ask price: %s', ask_price)
+            logger.info('Extracted bid price: %s', bid_price)
+            logger.info('Extracted ask price: %s', ask_price)
 
             url = self.market_url_ + f'/v2/stocks/{stock}/trades/latest'
             response = requests.get(url, headers=headers, timeout=30)
@@ -867,7 +887,6 @@ class Alpaca:
             }
             response = requests.get(url, headers=headers, timeout=30)
             if response.status_code in (200, 201):
-
                 data = response.json()
                 return data
             else:
@@ -923,11 +942,11 @@ class Alpaca:
             data = response.json()
             return data.get('daytrade_count', 0)  # Adjust based on actual API response structure
         except requests.exceptions.HTTPError as e:
-            print(f"HTTP Error: {e.response.status_code} - {e.response.reason}")
-            print(f"Response Content: {e.response.text}")
+            logger.warning(f"HTTP Error: {e.response.status_code} - {e.response.reason}")
+            logger.warning(f"Response Content: {e.response.text}")
             raise Error(f"Error fetching day trade count: {str(e)}") from e
         except Exception as e:
-            print(f"Unexpected Error: {str(e)}")
+            logger.warning(f"Unexpected Error: {str(e)}")
             raise Error(f"Error fetching day trade count: {str(e)}") from e
     
     def fetch_daytrade_count(self):
@@ -944,11 +963,11 @@ class Alpaca:
             data = response.json()
             return data.get('daytrade_count', 0)  # Adjust based on actual API response structure
         except requests.exceptions.HTTPError as e:
-            print(f"HTTP Error: {e.response.status_code} - {e.response.reason}")
-            print(f"Response Content: {e.response.text}")
+            logger.warning(f"HTTP Error: {e.response.status_code} - {e.response.reason}")
+            logger.warning(f"Response Content: {e.response.text}")
             raise Error(f"Error fetching day trade count: {str(e)}") from e
         except Exception as e:
-            print(f"Unexpected Error: {str(e)}")
+            logger.warning(f"Unexpected Error: {str(e)}")
             raise Error(f"Error fetching day trade count: {str(e)}") from e
 
     def fetch_dry_balance(self):
@@ -1095,79 +1114,7 @@ class Alpaca:
                 return data
         except requests.RequestException as e:
             raise Error(f"Error fetching account positions: {str(e)}") from e
-
-    def create_paper_order_extended(
-        self,
-        symbol: str,
-        order_type: str,
-        side: str,
-        amount: float,
-        rate: float,
-        leverage: int=1,
-        params: Dict[str, Any] = None,
-        stop_loss: bool = False,
-    ) -> None:
-        """Function - Create paper order for extended hours"""
-        try:
-            time_in_force = "day" if isinstance(amount, float) else "gtc"
-            parts = symbol.split('/')
-            is_crypto = False
-            if len(parts) ==2:
-                #its equity
-                is_crypto = False
-            if len(parts) > 2:
-                is_crypto = True         
-            if is_crypto:
-                time_in_force = "ioc"
-                symbol = parts[0] + '/' + parts[-1]
-            print(symbol, order_type, side, amount, rate, leverage, params, stop_loss, time_in_force)
-            if order_type == 'market':
-                url = self.paper_url + "/v2/orders"
-                data = {
-                    "symbol": symbol,
-                    "qty": amount,
-                    "side": side,
-                    "type": order_type,
-                    "time_in_force": time_in_force,
-                    "extended_hours": True
-                }
-                headers = {
-                    "Accept": "application/json",
-                    "Content-Type": "application/json",  # Specifies the format of the request payload
-                    "APCA-API-KEY-ID": self.paper_key,
-                    "APCA-API-SECRET-KEY": self.paper_secret
-                }
-                response = requests.post(url, json=data, headers=headers, timeout=30)
-
-                # Raise an error for HTTP status codes other than 2xx
-                response.raise_for_status()  # Raise an error if the request was not successful
-                return response.json()
-
-            elif order_type == 'limit':
-                url = self.paper_url + "/v2/orders"
-                data = {
-                    "symbol": symbol,
-                    "qty": float(amount),
-                    "side": side,
-                    "type": order_type,
-                    "limit_price": rate,
-                    "time_in_force": time_in_force,
-                    "extended_hours": True
-                }
-                #print(data)
-                headers = {
-                    "Accept": "application/json",
-                    "Content-Type": "application/json",  # Specifies the format of the request payload
-                    "APCA-API-KEY-ID": self.paper_key,
-                    "APCA-API-SECRET-KEY": self.paper_secret
-                }
-                response = requests.post(url, json=data, headers=headers, timeout=30)
-                response.raise_for_status()
-                return response.json()
-
-        except Exception as e:
-            raise Error(f"Error creating order: {str(e)}") from e
-
+            
     def create_paper_order(
         self,
         symbol: str,
@@ -1178,21 +1125,20 @@ class Alpaca:
         leverage: int=1,
         params: Dict[str, Any] = None,
         stop_loss: bool = False,
+        is_crypto: bool = False
     ):
-        """Function - create alpaca paper order"""
+        """Function - Create a paper order"""
         try:
             time_in_force = "day" if isinstance(amount, float) else "gtc"
-            parts = symbol.split('/')
-            is_crypto = False
-            if len(parts) ==2:
-                #its equity
-                is_crypto = False
+            is_crypto=False
+            parts=symbol.split('/')
             if len(parts) > 2:
-                is_crypto = True     
-            if is_crypto:
-                time_in_force = "ioc"
-                symbol = parts[0] + '/' + parts[-1]            
-            #print(symbol, order_type, side, amount, rate, leverage, params, stop_loss, time_in_force)
+                is_crypto=True
+                symbol=parts[0] + '/' + parts[1]
+                time_in_force='ioc'
+            else:
+                symbol = parts[0]
+
             if order_type == 'market':
                 url = self.paper_url + "/v2/orders"
                 data = {
@@ -1202,6 +1148,7 @@ class Alpaca:
                     "type": order_type,
                     "time_in_force": time_in_force
                 }
+                
                 headers = {
                     "Accept": "application/json",
                     "Content-Type": "application/json",  # Specifies the format of the request payload
@@ -1210,32 +1157,67 @@ class Alpaca:
                 }
                 response = requests.post(url, json=data, headers=headers, timeout=30)
                 # Raise an error for HTTP status codes other than 2xx
+                #logger.info(f"Response Status Code: {response.status_code}")
+                #logger.info(f"Response Text: {response.text}")
                 response.raise_for_status()  # Raise an error if the request was not successful
-                return response.json()
+                keys = ['average', 'filled', 'limit_price', 'filled_avg_price', 'filled_qty', 'qty']
+                data_r = response.json()
+                data_keys = data_r.keys()
+
+                for k in keys:
+                    if k in data_keys:
+                        data_r[k] = float(data_r[k]) if data_r[k] else 0
+                #list of orders
+                return data_r
 
             elif order_type == 'limit':
+                #bot checks if its extended hours trading or not
+                #so we can set all limit order to GTC
                 url = self.paper_url + "/v2/orders"
-                data = {
-                    "symbol": symbol,
-                    "qty": float(amount),
-                    "side": side,
-                    "type": order_type,
-                    "limit_price": rate,
-                    "time_in_force": time_in_force
-                }
-                #print(data)
+                #"message": "fractional orders must be DAY orders"
+                #"message":"extended hours order must be DAY limit orders"
+                if self.is_extended_hours and not is_crypto:
+                    data = {
+                        "symbol": symbol,
+                        "qty": int(amount),
+                        "side": side,
+                        "type": order_type,
+                        "limit_price": rate,
+                        "time_in_force": "day",
+                        "extended_hours": True
+                    }
+                else:
+                    data = {
+                        "symbol": symbol,
+                        "qty": float(amount),
+                        "side": side,
+                        "type": order_type,
+                        "limit_price": rate,
+                        "time_in_force": time_in_force
+                    }
+                logger.info(data)
                 headers = {
                     "Accept": "application/json",
-                    # Specifies the format of the request payload
-                    "Content-Type": "application/json",
+                    "Content-Type": "application/json",  # Specifies the format of the request payload
                     "APCA-API-KEY-ID": self.paper_key,
                     "APCA-API-SECRET-KEY": self.paper_secret
                 }
+
                 response = requests.post(url, json=data, headers=headers, timeout=30)
+                #logger.info(f"Response Status Code: {response.status_code}")
+                #logger.info(f"Response Text: {response.text}")
                 response.raise_for_status()
-                return response.json()
+                keys = ['average', 'filled', 'limit_price', 'filled_avg_price', 'filled_qty', 'qty']
+                data_r = response.json()
+                data_keys = data_r.keys()
+                for k in keys:
+                    if k in data_keys:
+                        data_r[k] = float(data_r[k]) if data_r[k] else 0
+                #list of orders
+                return data_r
+
         except Exception as e:
-            raise Error(f"Error creating order: {str(e)}") from e
+            raise Error(f"Error creating order: {str(e)}")
 
     def create_order(
         self,
@@ -1244,22 +1226,30 @@ class Alpaca:
         side: str,
         amount: float,
         rate: float,
-        leverage: int=1
+        leverage: int=1,
+        params: Dict[str, Any] = None,
+        stop_loss: bool = False,
+        is_crypto: bool = False
     ):
-        """Function - create alpaca live order"""
+        """Function - Create a live order"""
         try:
-            #counting parts to distinguish crypto from us equity.
-            parts = symbol.split('/')
-            is_crypto = False
-            if len(parts) ==2:
-                #its equity
-                is_crypto = False
-            if len(parts) > 2:
-                is_crypto = True           
+
+            headers = {
+                "Accept": "application/json",
+                "Content-Type": "application/json",  # Specifies the format of the request payload
+                "APCA-API-KEY-ID": self.market_key,
+                "APCA-API-SECRET-KEY": self.market_secret
+            }
             time_in_force = "day" if isinstance(amount, float) else "gtc"
-            if is_crypto:
-                time_in_force = "ioc"
-                symbol = parts[0] + '/' + parts[-1]
+            is_crypto=False
+            parts=symbol.split('/')
+            if len(parts) > 2:
+                is_crypto=True
+                symbol=parts[0] + '/' + parts[1]
+                time_in_force='ioc'
+            else:
+                symbol = parts[0]
+
             if order_type == 'market':
                 url = self.live_url + "/v2/orders"
                 data = {
@@ -1269,53 +1259,69 @@ class Alpaca:
                     "type": order_type,
                     "time_in_force": time_in_force
                 }
-                #logger.info(f'the data being sent its a market order {data}')
-                headers = {
-                    "Accept": "application/json",
-                    # Specifies the format of the request payload
-                    "Content-Type": "application/json",
-                    "APCA-API-KEY-ID": self.market_key,
-                    "APCA-API-SECRET-KEY": self.market_secret
-                }
                 response = requests.post(url, json=data, headers=headers, timeout=30)
-                print(f"Response Status Code: {response.status_code}")
-                print(f"Response Text: {response.text}")
+                # Raise an error for HTTP status codes other than 2xx
+                #logger.info(f"Response Status Code: {response.status_code}")
+                #logger.info(f"Response Text: {response.text}")
                 response.raise_for_status()  # Raise an error if the request was not successful
-                return response.json()
-            
-            elif order_type == 'limit':
-                url = self.live_url + "/v2/orders"
-                #logger.info(f'{data}')
-                data = {
-                    "symbol": symbol,
-                    "qty": amount,
-                    "side": side,
-                    "type": order_type,
-                    "limit_price": rate,
-                    "time_in_force": time_in_force
-                }
-                #print(data)
-                headers = {
-                    "Accept": "application/json",
-                    "Content-Type": "application/json",  # Specifies the format of the request payload
-                    "APCA-API-KEY-ID": self.market_key,
-                    "APCA-API-SECRET-KEY": self.market_secret
-                }
-                response = requests.post(url, json=data, headers=headers, timeout=30)
-                #print(f"Response Status Code: {response.status_code}")
-                #print(f"Response Text: {response.text}")
-                response.raise_for_status()
-                return response.json()
-        except Exception as e:
-            raise Error(f"Error creating order: {str(e)}") from e
+                keys = ['average', 'filled', 'limit_price', 'filled_avg_price', 'filled_qty', 'qty']
+                data_r = response.json()
+                data_keys = data_r.keys()
 
+                for k in keys:
+                    if k in data_keys:
+                        data_r[k] = float(data_r[k]) if data_r[k] else 0
+                #list of orders
+                return data_r
+
+            elif order_type == 'limit':
+                #bot checks if its extended hours trading or not
+                #so we can set all limit order to GTC
+                url = self.live_url + "/v2/orders"
+                #"message": "fractional orders must be DAY orders"
+                #"message":"extended hours order must be DAY limit orders"
+                if self.is_extended_hours and not is_crypto:
+                    data = {
+                        "symbol": symbol,
+                        "qty": int(amount),
+                        "side": side,
+                        "type": order_type,
+                        "limit_price": rate,
+                        "time_in_force": "day",
+                        "extended_hours": True
+                    }
+                else:
+                    data = {
+                        "symbol": symbol,
+                        "qty": float(amount),
+                        "side": side,
+                        "type": order_type,
+                        "limit_price": rate,
+                        "time_in_force": time_in_force
+                    }
+                logger.info(data)
+                response = requests.post(url, json=data, headers=headers, timeout=30)
+                #logger.info(f"Response Status Code: {response.status_code}")
+                #logger.info(f"Response Text: {response.text}")
+                response.raise_for_status()
+                keys = ['average', 'filled', 'limit_price', 'filled_avg_price', 'filled_qty', 'qty']
+                data_r = response.json()
+                data_keys = data_r.keys()
+                for k in keys:
+                    if k in data_keys:
+                        data_r[k] = float(data_r[k]) if data_r[k] else 0
+                #list of orders
+                return data_r
+
+        except Exception as e:
+            raise Error(f"Error creating order: {str(e)}")
+        
     def fetch_dry_orders(
         self,
         symbol,
         since_ms,
         params=None
     ):
-        """Function - fetch alpaca paper orders"""
         try:
             # Get the orders for the specified symbol
             #since_iso8601 = datetime.datetime.fromtimestamp(since_ms / 1000.0).isoformat()
@@ -1331,23 +1337,28 @@ class Alpaca:
                 "APCA-API-SECRET-KEY": self.paper_secret
             }
             response = requests.get(url, headers=headers, timeout=30)
-            print(f"Response Status Code: {response.status_code}")
-            print(f"Response Text: {response.text}")
+            #logger.info(f"Response Status Code: {response.status_code}")
+            #logger.info(f"Response Text: {response.text}")
             response.raise_for_status()  # Raise an error if the request was not successful
-            data = response.json()
-
+            data_r = response.json()
+            data_r = data_r.get('orders', None)
+            keys = ['average', 'filled', 'limit_price', 'filled_avg_price', 'filled_qty', 'qty']
+            for data in data_r:
+                data_keys = data.keys()
+                for k in keys:
+                    if k in data_keys:
+                        data[k] = float(data[k]) if data[k] else 0
             #list of orders
-            return data
+            return data_r
         except Exception as e:
-            raise Error(f"Error fetching orders {e}") from e
+            raise Error(f"Error fetching orders {e}")
 
     async def fetch_orders(
         self,
         symbol,
         since_ms,
-        params=None
+        params=None 
     ):
-        """Async Function - fetch alpaca live orders"""
         try:
             # Get the orders for the specified symbol
             #since_iso8601 = datetime.datetime.fromtimestamp(since_ms / 1000.0).isoformat()
@@ -1361,20 +1372,28 @@ class Alpaca:
                 "APCA-API-SECRET-KEY": self.market_secret
             }
             response = requests.get(url, headers=headers, timeout=30)
-            print(f"Response Status Code: {response.status_code}")
-            print(f"Response Text: {response.text}")
+            #logger.info(f"Response Status Code: {response.status_code}")
+            #logger.info(f"Response Text: {response.text}")
             response.raise_for_status()  # Raise an error if the request was not successful
-            data = response.json()
-            orders = data.get('orders')
-            return orders
+            data_r = response.json()
+            data_r = data_r.get('orders', None)
+            keys = ['average', 'filled', 'limit_price', 'filled_avg_price', 'filled_qty', 'qty']
+            for data in data_r:
+                data_keys = data.keys()
+                for k in keys:
+                    if k in data_keys:
+                        data[k] = float(data[k]) if data[k] else 0
+            #data = self.get_fee_orders(pair=pair, taker_or_maker=taker_or_maker, dry=self.config['dry_run'], is_backtest=self.config['runmode']==RunMode.BACKTEST, orders=data_r)
+            #list of orders
+            return data
         except Exception as e:
-            raise Error(f"Error fetching orders for symbol: {str(e)}") from e
+            raise Error(f"Error fetching orders for symbol: {str(e)}")
 
     def fetch_order(
         self,
         order_id: str,
     ):
-        """Function - fetch alpaca live orders"""
+        """Function - Fetch live order"""
         try:
             url = f"{self.live_url}/v2/orders/{order_id}"
             headers = {
@@ -1385,15 +1404,64 @@ class Alpaca:
             response = requests.get(url, headers=headers, timeout=30)
             response.raise_for_status()  # Raise an error if the request was not successful
             data = response.json()
+
+            keys = ['average', 'filled', 'limit_price', 'filled_avg_price', 'filled_qty', 'qty']
+            data_keys = data.keys()
+            for k in keys:
+                if k in data_keys:
+                    data[k] = float(data[k]) if data[k] else 0
+            taker_or_maker='taker' if data['order_type'] == 'market' else 'maker'
+            quote = 'USD'
+            if data['asset_class'] != 'crypto':
+                quote = 'USD'
+                pair = data['symbol'] + '/USD'
+            elif data['asset_class'] == 'crypto':
+                quote = data['symbol'].split('/')[1]
+                pair = data['symbol'] + '/USD'
+            else:
+                pair = data['symbol'] + '/USD'
+            fee = self.get_fee(pair=pair, taker_or_maker=taker_or_maker, dry=self.config['dry_run'], is_backtest=self.config['runmode']==RunMode.BACKTEST)
+            cost = None
+
+            logger.info(f'the fee fetched from params : {pair,taker_or_maker} -> {fee}')
+            if data['filled_at']:
+                cost = data['filled_avg_price'] * data['filled_qty']
+                data["cost"] = cost
+                data["fee"] = {
+                            "currency": quote,
+                            "cost": cost * fee,
+                            "rate": fee,
+                        }
             return data
         except requests.RequestException as e:
-            raise Error(f"Error fetching order for order ID {order_id}: {str(e)}") from e
-        
+            raise Error(f"Error fetching order for order ID {order_id}: {str(e)}")
+    def real_amount_after_filled(
+        self,
+        pair,
+        dry_run
+    ):
+        """
+        Temporary fix until Alpaca has real time fee returns
+        see: https://docs.alpaca.markets/docs/crypto-fees
+        returns the amount available in the account of the given pair
+        """
+
+        balance = self.fetch_dry_balance()
+        logger.info(f'the balance {balance}')
+        #check for crypto format
+        parts = pair.split('/')
+        if len(parts)>2:
+            symbol = parts[0] + parts[1]
+        else:
+            symbol = pair[0]
+        if dry_run:
+            amount = balance[symbol]['free']
+        return amount
     def fetch_dry_order(
             self,
             order_id: str,
     ):
-        """Function - fetch alpaca dry(paper) order by order id"""
+        """Function - Fetch dry order"""
         try:
             url = f"{self.paper_url}/v2/orders/{order_id}"
             headers = {
@@ -1404,9 +1472,38 @@ class Alpaca:
             response = requests.get(url, headers=headers, timeout=30)
             response.raise_for_status()  # Raise an error if the request was not successful
             data = response.json()
+
+            keys = ['average', 'filled', 'limit_price', 'filled_avg_price', 'filled_qty', 'qty']
+            data_keys = data.keys()
+            for k in keys:
+                if k in data_keys:
+                    data[k] = float(data[k]) if data[k] else 0
+            taker_or_maker='taker' if data['order_type'] == 'market' else 'maker'
+            quote = 'USD'
+            if data['asset_class'] != 'crypto':
+                quote = 'USD'
+                pair = data['symbol'] + '/USD'
+            elif data['asset_class'] == 'crypto':
+                quote = data['symbol'].split('/')[-1]
+                pair = data['symbol'] + '/USD'
+            else:
+                pair = data['symbol'] + '/USD'
+            fee = self.get_fee(pair=pair, taker_or_maker=taker_or_maker, dry=self.config['dry_run'], is_backtest=self.config['runmode']==RunMode.BACKTEST)
+            cost = None
+
+            #logger.info(f'the fee fetch from params : {pair,taker_or_maker} -> {fee}')
+            if data['filled_at']:
+                cost = data['filled_qty'] * fee
+                data["cost"] = cost
+                data["fee"] = {
+                            "currency": quote,
+                            "cost": cost * fee,
+                            "rate": fee,
+                        }
+                    
             return data
         except requests.RequestException as e:
-            raise Error(f"Error fetching order for order ID {order_id}: {str(e)}") from e
+            raise Error(f"Error fetching order for order ID {order_id}: {str(e)}")
         
     async def fetch_ohlcv(
         self,
@@ -1432,13 +1529,7 @@ class Alpaca:
             elif len(parts)==2:
                 base, quote = parts[0],parts[1]
                 url = f"{self.market_url}?symbols={base}&timeframe={formatted_timeframe}&start={start_time}"
-            #print(url)
-            headers = {
-                "Accept": "application/json",
-                "APCA-API-KEY-ID": self.market_key,
-                "APCA-API-SECRET-KEY": self.market_secret
-            }
-
+            headers = self.live_headers if not self.is_dry else self.paper_headers
             all_bars = []
             next_page_token = None
             while True:
@@ -1481,6 +1572,7 @@ class Alpaca:
                 [int(item['t']), item['o'], item['h'], item['l'], item['c'], item['v']]
                 for item in all_bars
             ]
+            #print(len(ohlcv_data))
             #latest_bar = ohlcv_data[-1][0]
             #print("Last available candle time:", latest_bar)
             return ohlcv_data
@@ -1564,12 +1656,12 @@ class Alpaca:
                 missing_intervals.append((previous_timestamp, current_timestamp))
 
         if missing_intervals:
-            print(f"Missing intervals found: {missing_intervals}")
-            print("Filling them before storage")
+            logger.warning(f"Missing intervals found: {missing_intervals}")
+            logger.warning("Filling them before storage")
             filled_data = self.fill_missing_intervals(df, timeframe)
             return filled_data
         else:
-            print("No missing intervals found. All intervals are accounted for.")
+            logger.info("No missing intervals found. All intervals are accounted for.")
             return df
 
         return missing_intervals
@@ -1607,7 +1699,7 @@ class Alpaca:
             all_bars = []
             while True:
                 #logger.info(f'theurl {url}')
-                response = requests.get(url, headers=self.mheaders, timeout=30)
+                response = requests.get(url, headers=self.paper_headers, timeout=30)
                 if response.status_code == 200:
                     data = response.json()
                     the_key = f"{pair.split('/')[0]}/{str(quote)}" if is_crypto else base
@@ -1622,7 +1714,7 @@ class Alpaca:
                     else:
                         break
                 else:
-                    print(f"Failed to fetch data: {response.status_code} - {response.text}")
+                    logger.warning(f"Failed to fetch data: {response.status_code} - {response.text}")
                     break
     
             # Convert the timestamp format to milliseconds
@@ -1635,12 +1727,11 @@ class Alpaca:
                 [int(item['t']), item['o'], item['h'], item['l'], item['c'], item['v']]
                 for item in all_bars
             ]
-            print(len(ohlcv_data))
             return ohlcv_data
 
         except Exception as e:
             error_message = f"An error occurred: {str(e)}\n\nFull traceback:\n{traceback.format_exc()}"
-            print(error_message)
+            raise Error(error_message) from e
             return []
     def get_stock_fee(self, taker_or_maker='taker'):
         """Function - Return stock fee for alpaca exchange"""
@@ -1670,6 +1761,170 @@ class Alpaca:
         if not tier:
             raise Error("total_volume out of range or invalid fee_tier table")
         return tier
+
+    def get_fee_orders(self, pair, orders, taker_or_maker='taker', dry=False, is_backtest=True):
+        """
+        Function - Return fee for alpaca exchange
+        Possibly used by backtest.py
+        """
+        logger.info(f'get_fee_orders pair -> {pair}')
+        if len(pair.split("/"))==2:
+            return 0.0
+        
+        if is_backtest:
+            #use worst case trading fee
+            return 0.0025
+        if dry:
+            headers = {
+                'Accept': 'application/json',
+                'Apca-Api-Secret-Key': self.paper_secret,
+                'Apca-Api-Key-Id': self.paper_key
+            }
+        else:
+            headers = {
+                'Accept': 'application/json',
+                'Apca-Api-Secret-Key': self.market_secret,
+                'Apca-Api-Key-Id': self.market_key
+            }
+
+        #calculate the 30day trading volume from filled trades of the account
+        def get_fee_tier(total_volume):
+            tier = None
+            if 0 <= total_volume <= 100000:
+                tier = {'maker': 0.0015, 'taker': 0.0025}
+            elif 100000 < total_volume <= 500000:
+                tier = {'maker': 0.0012, 'taker': 0.0022}
+            elif 500000 < total_volume <= 1000000:
+                tier = {'maker': 0.0010, 'taker': 0.0020}
+            elif 1000000 < total_volume <= 10000000:
+                tier = {'maker': 0.0008, 'taker': 0.0018}
+            elif 10000000 < total_volume <= 25000000:
+                tier = {'maker': 0.0005, 'taker': 0.0015}
+            elif 25000000 < total_volume <= 50000000:
+                tier = {'maker': 0.0002, 'taker': 0.0013}
+            elif 50000000 < total_volume <= 100000000:
+                tier = {'maker': 0.0002, 'taker': 0.0012}
+            elif total_volume > 100000000:
+                tier = {'maker': 0.0000, 'taker': 0.0010}
+            else:
+                raise ValueError("Invalid total_volume value. It must be a non-negative number.")
+            if not tier:
+                raise Error("total_volume out of range or invalid fee_tier table")
+            return tier
+        # Calculate the start date (30 days ago)
+        start_date = datetime.now() - timedelta(days=30)
+        # Format it to ISO 8601 (date only)
+        formatted_date = start_date.strftime("%Y-%m-%d")
+        # If time is required, include it
+        formatted_datetime = start_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+        #use pandas
+        filled_orders = []
+        for order in orders:
+            if order['filled_at']:
+                filled_orders.append(order)
+        df = pd.DataFrame(filled_orders)
+        df['volume'] = df['filled_qty'] * df['filled_avg_price']
+    
+        for idx, order in df.itterows():
+            #get all preceeding order from the prior 30 days and calculate the total volume until that point
+            current_order_date = order['created_at']
+
+            # Filter orders that are within the last 30 days of the current order
+            time_window_start = current_order_date - timedelta(days=30)
+            # Sum the volume of orders within the 30 day window (excluding the current order itself)
+            volume_in_window = df[(df['created_at'] <= current_order_date) & 
+                                (df['created_at'] > time_window_start)]['volume'].sum()
+            cost = None
+            taker_or_maker='taker' if df['order_type'] == 'market' else 'maker'
+            quote = 'USD'
+            if df['asset_class'] != 'crypto':
+                quote = 'USD'
+                pair = df['symbol'] + '/USD'
+            elif df['asset_class'] == 'crypto':
+                quote = df['symbol'].split('/')[1]
+                pair = df['symbol'] + '/USD'
+            else:
+                pair = df['symbol'] + '/USD'
+            cost = df['filled_avg_price'] * df['filled_qty']
+            fee = get_fee_tier(volume_in_window)
+            df["cost"] = cost
+            df["fee"] = {
+                        "currency": quote,
+                        "cost": cost * fee,
+                        "rate": fee,
+                    }
+        data = df.to_list()
+        return data
+
+    def get_fee(self, pair, taker_or_maker='taker', dry=False, is_backtest=True):
+        """
+        Function - Return fee for alpaca exchange
+        Possibly used by backtest.py
+        """
+        if len(pair.split("/"))==2:
+            return 0.0
+        if is_backtest:
+            #use worst case trading fee
+            return 0.0025
+        if dry:
+            headers = {
+                'Accept': 'application/json',
+                'Apca-Api-Secret-Key': self.paper_secret,
+                'Apca-Api-Key-Id': self.paper_key
+            }
+        else:
+            headers = {
+                'Accept': 'application/json',
+                'Apca-Api-Secret-Key': self.market_secret,
+                'Apca-Api-Key-Id': self.market_key
+            }
+
+        #calculate the 30day trading volume from filled trades of the account
+
+        # Calculate the start date (30 days ago)
+        start_date = datetime.now() - timedelta(days=30)
+        # Format it to ISO 8601 (date only)
+        formatted_date = start_date.strftime("%Y-%m-%d")
+        # If time is required, include it
+        formatted_datetime = start_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+        url = "https://api.alpaca.markets/v2/account/activities" if not dry else "https://paper-api.alpaca.markets/v2/account/activities"
+        params = {"activity_types": "FILL", "after": formatted_datetime}
+
+        response = requests.get(url, headers=headers, params=params, timeout=30)
+        if response.status_code == 200:
+            activities = response.json()
+            total_volume = sum(
+                float(activity["qty"]) for activity in activities if activity["symbol"].endswith("USD")
+            )
+            logger.info(f"30-day crypto trading volume: {total_volume}")
+            def get_fee_tier(total_volume):
+                tier = None
+                if 0 <= total_volume <= 100000:
+                    tier = {'maker': 0.0015, 'taker': 0.0025}
+                elif 100000 < total_volume <= 500000:
+                    tier = {'maker': 0.0012, 'taker': 0.0022}
+                elif 500000 < total_volume <= 1000000:
+                    tier = {'maker': 0.0010, 'taker': 0.0020}
+                elif 1000000 < total_volume <= 10000000:
+                    tier = {'maker': 0.0008, 'taker': 0.0018}
+                elif 10000000 < total_volume <= 25000000:
+                    tier = {'maker': 0.0005, 'taker': 0.0015}
+                elif 25000000 < total_volume <= 50000000:
+                    tier = {'maker': 0.0002, 'taker': 0.0013}
+                elif 50000000 < total_volume <= 100000000:
+                    tier = {'maker': 0.0002, 'taker': 0.0012}
+                elif total_volume > 100000000:
+                    tier = {'maker': 0.0000, 'taker': 0.0010}
+                else:
+                    raise ValueError("Invalid total_volume value. It must be a non-negative number.")
+                if not tier:
+                    raise Error("total_volume out of range or invalid fee_tier table")
+                return tier
+            return get_fee_tier(total_volume)[taker_or_maker]
+
+        else:
+            logger.error("Failed to fetch trading fees from Alpaca: %s %s", response.status_code, response.text)
+            return None
     def get_fee_crypto(self, taker_or_maker='taker', dry=False, is_backtest=True):
         """
         Function - Return crypto fee for alpaca exchange
@@ -1707,7 +1962,7 @@ class Alpaca:
             total_volume = sum(
                 float(activity["qty"]) for activity in activities if activity["symbol"].endswith("USD")
             )
-            print(f"30-day crypto trading volume: {total_volume}")
+            logger.info(f"30-day crypto trading volume: {total_volume}")
             def get_fee_tier(total_volume):
                 tier = None
                 if 0 <= total_volume <= 100000:

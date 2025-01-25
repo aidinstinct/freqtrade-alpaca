@@ -58,6 +58,11 @@ def validate_exchange(exchange: str) -> tuple[bool, str, ccxt.Exchange | None]:
     returns: can_use, reason, exchange_object
         with Reason including both missing and missing_opt
     """
+
+    if exchange.lower() == 'alpaca':
+        result=True
+        reason='Supported by custom implementation.'
+        return result, reason, None
     try:
         ex_mod = getattr(ccxt.pro, exchange.lower())()
     except AttributeError:
