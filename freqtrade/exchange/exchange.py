@@ -1,5 +1,5 @@
 """
-Cryptocurrency,Alpaca Exchanges support
+Ccxt, Alpaca Exchanges
 """
 from typing import List, Tuple, Any, Dict, Literal, Optional, TypeGuard
 import asyncio
