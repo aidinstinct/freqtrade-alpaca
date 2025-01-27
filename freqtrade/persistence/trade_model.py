@@ -1479,10 +1479,10 @@ class LocalTrade:
                 self.close_profit = close_profit
                 self.realized_profit = close_profit_abs
                 self.close_profit_abs = prof.profit_abs
-            #current_amount_tr = amount_to_contract_precision(
-            #    float(current_amount), self.amount_precision, self.precision_mode, self.contract_size
-            #)
-            current_amount_tr = self.amount
+            current_amount_tr = amount_to_contract_precision(
+                float(current_amount), self.amount_precision, self.precision_mode, self.contract_size
+            )
+            #current_amount_tr = self.amount
             if current_amount_tr > 0.0:
                 # Trade is still open
                 # Leverage not updated, as we don't allow changing leverage through DCA at the moment.
