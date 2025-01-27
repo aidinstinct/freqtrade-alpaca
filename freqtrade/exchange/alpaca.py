@@ -1445,17 +1445,20 @@ class Alpaca:
         see: https://docs.alpaca.markets/docs/crypto-fees
         returns the amount available in the account of the given pair
         """
-
-        balance = self.fetch_dry_balance()
-        logger.info(f'the balance {balance}')
+        if dry_run:
+            balance = self.fetch_dry_balance()
+            logger.info(f'the balance {balance}')
+        else:
+            balance = self.fetch_balance()
+            logger.info(f'the balance {balance}')
         #check for crypto format
+        print(f'{pair}')
         parts = pair.split('/')
         if len(parts)>2:
             symbol = parts[0] + parts[1]
         else:
-            symbol = pair[0]
-        if dry_run:
-            amount = balance[symbol]['free']
+            symbol = pair.split('/')[0]
+        amount = balance[symbol]['free']
         return amount
     def fetch_dry_order(
             self,
